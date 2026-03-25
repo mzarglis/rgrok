@@ -37,14 +37,12 @@ pub async fn serve(
         tokio::spawn(async move {
             if let Some(acceptor) = tls_acceptor {
                 match acceptor.accept(tcp_stream).await {
-                    Ok(tls_stream) => {
-                        match tokio_tungstenite::accept_async(tls_stream).await {
-                            Ok(ws) => handle_client(ws, state).await,
-                            Err(e) => {
-                                warn!(peer = %peer_addr, "WebSocket upgrade failed: {}", e);
-                            }
+                    Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
+                        Ok(ws) => handle_client(ws, state).await,
+                        Err(e) => {
+                            warn!(peer = %peer_addr, "WebSocket upgrade failed: {}", e);
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!(peer = %peer_addr, "TLS handshake failed: {}", e);
                     }
@@ -62,10 +60,8 @@ pub async fn serve(
 }
 
 /// Handle a single client session over yamux-multiplexed WebSocket.
-async fn handle_client<S>(
-    ws: tokio_tungstenite::WebSocketStream<S>,
-    state: Arc<ServerState>,
-) where
+async fn handle_client<S>(ws: tokio_tungstenite::WebSocketStream<S>, state: Arc<ServerState>)
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     state.metrics.ws_connections_active.inc();
@@ -76,19 +72,15 @@ async fn handle_client<S>(
     let (_mux_control, mut inbound_rx, driver_handle) = spawn_yamux_driver(mux);
 
     // Accept stream 0 = control channel (with timeout)
-    let mut ctrl_stream = match tokio::time::timeout(
-        Duration::from_secs(5),
-        inbound_rx.recv(),
-    )
-    .await
-    {
-        Ok(Some(stream)) => stream,
-        _ => {
-            warn!("Client did not open control stream within 5 seconds");
-            driver_handle.abort();
-            return;
-        }
-    };
+    let mut ctrl_stream =
+        match tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv()).await {
+            Ok(Some(stream)) => stream,
+            _ => {
+                warn!("Client did not open control stream within 5 seconds");
+                driver_handle.abort();
+                return;
+            }
+        };
 
     // Step 1: Expect Auth within 5 seconds
     let auth_msg: ClientMsg = match tokio::time::timeout(
@@ -278,7 +270,10 @@ async fn handle_control_msg(
                 Some(s) => {
                     if let Err(e) = validate_subdomain(s) {
                         let _ = control_tx
-                            .send(ServerMsg::Error { code: 400, message: e })
+                            .send(ServerMsg::Error {
+                                code: 400,
+                                message: e,
+                            })
                             .await;
                         return;
                     }
@@ -306,7 +301,10 @@ async fn handle_control_msg(
 
             let public_url = match &tunnel_type {
                 TunnelType::Http | TunnelType::Https => {
-                    format!("https://{}.{}", assigned_subdomain, state.config.server.domain)
+                    format!(
+                        "https://{}.{}",
+                        assigned_subdomain, state.config.server.domain
+                    )
                 }
                 TunnelType::Tcp { remote_port } => {
                     let port = match remote_port {
@@ -384,7 +382,11 @@ async fn handle_control_msg(
             );
 
             let _ = control_tx
-                .send(ServerMsg::TunnelAck { id, public_url, tunnel_type })
+                .send(ServerMsg::TunnelAck {
+                    id,
+                    public_url,
+                    tunnel_type,
+                })
                 .await;
         }
 

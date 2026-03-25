@@ -18,6 +18,7 @@ pub struct Metrics {
     pub bytes_in_total: IntCounter,
     pub bytes_out_total: IntCounter,
     pub ws_connections_active: IntGauge,
+    #[allow(dead_code)]
     pub tunnel_errors_total: IntCounterVec,
 }
 
@@ -37,8 +38,13 @@ impl Metrics {
         registry.register(Box::new(requests_total.clone())).unwrap();
 
         let request_duration_ms = HistogramVec::new(
-            HistogramOpts::new("rgrok_request_duration_ms", "Request duration in milliseconds")
-                .buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]),
+            HistogramOpts::new(
+                "rgrok_request_duration_ms",
+                "Request duration in milliseconds",
+            )
+            .buckets(vec![
+                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0,
+            ]),
             &["method"],
         )
         .expect("metric creation failed");

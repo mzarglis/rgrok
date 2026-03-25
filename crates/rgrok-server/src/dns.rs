@@ -83,11 +83,7 @@ impl CloudflareClient {
     }
 
     /// Create a TXT record (used for ACME DNS-01 challenges)
-    pub async fn create_txt_record(
-        &self,
-        name: &str,
-        value: &str,
-    ) -> anyhow::Result<String> {
+    pub async fn create_txt_record(&self, name: &str, value: &str) -> anyhow::Result<String> {
         let resp = self
             .client
             .post(format!(
@@ -209,7 +205,10 @@ mod tests {
             format!("http://127.0.0.1:{}", port),
         );
 
-        let record_id = client.create_record("test-sub", "1.2.3.4", 120).await.unwrap();
+        let record_id = client
+            .create_record("test-sub", "1.2.3.4", 120)
+            .await
+            .unwrap();
         assert_eq!(record_id, "rec-abc-123");
     }
 

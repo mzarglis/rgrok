@@ -73,9 +73,7 @@ async fn dashboard() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn list_requests(
-    State(state): State<Arc<InspectState>>,
-) -> Json<Vec<CapturedRequest>> {
+async fn list_requests(State(state): State<Arc<InspectState>>) -> Json<Vec<CapturedRequest>> {
     let queue = state.captures.lock().await;
     let mut requests: Vec<CapturedRequest> = queue.iter().cloned().collect();
     requests.sort_by(|a, b| b.captured_at.cmp(&a.captured_at));
@@ -179,22 +177,19 @@ async fn event_stream(
     State(state): State<Arc<InspectState>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.inspect_tx.subscribe();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
-        match result {
+    let stream =
+        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| match result {
             Ok(event) => {
                 let data = serde_json::to_string(&event).ok()?;
                 Some(Ok(Event::default().data(data)))
             }
             Err(_) => None,
-        }
-    });
+        });
 
     Sse::new(stream)
 }
 
-async fn tunnel_status(
-    State(state): State<Arc<InspectState>>,
-) -> Json<serde_json::Value> {
+async fn tunnel_status(State(state): State<Arc<InspectState>>) -> Json<serde_json::Value> {
     let count = state.captures.lock().await.len();
     Json(serde_json::json!({
         "local_port": state.local_port,
@@ -212,10 +207,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_reissues_request_to_local_service() {
         // Start a mock local service
-        let mock_app = Router::new().route(
-            "/api/test",
-            get(|| async { "replayed response" }),
-        );
+        let mock_app = Router::new().route("/api/test", get(|| async { "replayed response" }));
         let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mock_port = mock_listener.local_addr().unwrap().port();
         tokio::spawn(async move {

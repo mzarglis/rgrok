@@ -44,10 +44,7 @@ pub async fn serve_http(state: Arc<ServerState>) -> anyhow::Result<()> {
 
 /// Serve the public HTTPS proxy with TLS termination (port 443).
 /// Uses hyper to parse HTTP requests, enabling header-level features.
-pub async fn serve_https(
-    state: Arc<ServerState>,
-    tls_acceptor: TlsAcceptor,
-) -> anyhow::Result<()> {
+pub async fn serve_https(state: Arc<ServerState>, tls_acceptor: TlsAcceptor) -> anyhow::Result<()> {
     let bind_addr = format!("0.0.0.0:{}", state.config.server.https_port);
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("HTTPS proxy listening on {}", bind_addr);
@@ -114,9 +111,18 @@ async fn proxy_http_request(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // Extract Host header for routing
     let host = match req.headers().get(HOST) {
-        Some(h) => h.to_str().unwrap_or("").split(':').next().unwrap_or("").to_string(),
+        Some(h) => h
+            .to_str()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string(),
         None => {
-            return Ok(error_response(StatusCode::BAD_REQUEST, "Missing Host header"));
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing Host header",
+            ));
         }
     };
 
@@ -152,8 +158,7 @@ async fn proxy_http_request(
                     drop(cached); // release lock before slow bcrypt
                     match auth::parse_basic_auth_header(auth_str) {
                         Some((user, pass)) => {
-                            if user == ba.username
-                                && auth::verify_basic_auth_password(&pass, hash)
+                            if user == ba.username && auth::verify_basic_auth_password(&pass, hash)
                             {
                                 // Cache the successful header value
                                 *tunnel.cached_auth_header.lock().await =
@@ -236,7 +241,11 @@ async fn proxy_http_request(
     let mut raw_request = format!(
         "{} {} HTTP/1.1\r\n",
         parts.method,
-        parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
+        parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
     );
 
     // Rewrite Host header if tunnel has a custom host_header option
@@ -257,20 +266,33 @@ async fn proxy_http_request(
     raw_request.push_str("\r\n");
 
     // Write headers into the proxy stream
-    if proxy_stream.write_all(raw_request.as_bytes()).await.is_err() {
-        return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to write to tunnel"));
+    if proxy_stream
+        .write_all(raw_request.as_bytes())
+        .await
+        .is_err()
+    {
+        return Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            "Failed to write to tunnel",
+        ));
     }
 
     // Stream the request body
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => {
-            return Ok(error_response(StatusCode::BAD_REQUEST, "Failed to read request body"));
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Failed to read request body",
+            ));
         }
     };
     if !body_bytes.is_empty() {
         if proxy_stream.write_all(&body_bytes).await.is_err() {
-            return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to write body to tunnel"));
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "Failed to write body to tunnel",
+            ));
         }
     }
 
@@ -284,7 +306,10 @@ async fn proxy_http_request(
         let n = match proxy_stream.read(&mut temp).await {
             Ok(n) => n,
             Err(_) => {
-                return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to read from tunnel"));
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to read from tunnel",
+                ));
             }
         };
         if n == 0 {
@@ -296,10 +321,7 @@ async fn proxy_http_request(
         response_buf.extend_from_slice(&temp[..n]);
 
         // Check if we have the full header section
-        if response_buf
-            .windows(4)
-            .any(|w| w == b"\r\n\r\n")
-        {
+        if response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
         if response_buf.len() > 65536 {
@@ -320,7 +342,10 @@ async fn proxy_http_request(
     let header_str = String::from_utf8_lossy(&response_buf[..header_end]);
 
     // Parse status line
-    let first_line = header_str.lines().next().unwrap_or("HTTP/1.1 502 Bad Gateway");
+    let first_line = header_str
+        .lines()
+        .next()
+        .unwrap_or("HTTP/1.1 502 Bad Gateway");
     let status_code = first_line
         .split_whitespace()
         .nth(1)
@@ -374,7 +399,10 @@ async fn proxy_http_request(
             .lines()
             .skip(1)
             .take_while(|l| !l.is_empty())
-            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|l| {
+                l.split_once(": ")
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect();
 
         let body_truncated = body_data.len() > 1_048_576;
@@ -386,11 +414,13 @@ async fn proxy_http_request(
         };
 
         // Send completion event
-        let _ = state.inspect_tx.send(rgrok_proto::inspect::InspectEvent::RequestCompleted {
-            id: cap_id.clone(),
-            duration_ms,
-            resp_status: status_code,
-        });
+        let _ = state
+            .inspect_tx
+            .send(rgrok_proto::inspect::InspectEvent::RequestCompleted {
+                id: cap_id.clone(),
+                duration_ms,
+                resp_status: status_code,
+            });
 
         // Update the capture in the ring buffer (best-effort)
         if let Some(captures) = state.captures.get(&subdomain) {
@@ -411,18 +441,27 @@ async fn proxy_http_request(
 
     // Record Prometheus metrics
     let duration_for_metrics = start.elapsed().as_millis() as f64;
-    state.metrics.requests_total
+    state
+        .metrics
+        .requests_total
         .with_label_values(&[&status_code.to_string()])
         .inc();
-    state.metrics.request_duration_ms
+    state
+        .metrics
+        .request_duration_ms
         .with_label_values(&[&method_str_for_metrics])
         .observe(duration_for_metrics);
-    state.metrics.bytes_in_total.inc_by(raw_request.len() as u64);
+    state
+        .metrics
+        .bytes_in_total
+        .inc_by(raw_request.len() as u64);
     state.metrics.bytes_out_total.inc_by(body_data.len() as u64);
 
     let response = builder
         .body(Full::new(Bytes::from(body_data)))
-        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Response build error"));
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Response build error")
+        });
 
     Ok(response)
 }
@@ -444,7 +483,8 @@ async fn handle_http_connection(
     let host = match extract_host_header(&request_data) {
         Some(h) => h,
         None => {
-            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 16\r\n\r\nMissing Host header";
+            let response =
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 16\r\n\r\nMissing Host header";
             incoming.write_all(response).await?;
             return Ok(());
         }
@@ -538,7 +578,10 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 /// Extract the Host header from raw HTTP request data (used for port-80 redirect only)
 fn extract_host_header(request: &str) -> Option<String> {
     for line in request.lines() {
-        if let Some(value) = line.strip_prefix("Host: ").or_else(|| line.strip_prefix("host: ")) {
+        if let Some(value) = line
+            .strip_prefix("Host: ")
+            .or_else(|| line.strip_prefix("host: "))
+        {
             return Some(value.trim().split(':').next()?.to_string());
         }
     }

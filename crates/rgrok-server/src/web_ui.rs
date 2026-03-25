@@ -56,9 +56,7 @@ async fn dashboard() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn list_requests(
-    State(state): State<Arc<ServerState>>,
-) -> Json<Vec<CapturedRequest>> {
+async fn list_requests(State(state): State<Arc<ServerState>>) -> Json<Vec<CapturedRequest>> {
     let mut all_requests: Vec<CapturedRequest> = Vec::new();
 
     for entry in state.captures.iter() {
@@ -83,9 +81,7 @@ async fn get_request(
     Err(StatusCode::NOT_FOUND)
 }
 
-async fn clear_requests(
-    State(state): State<Arc<ServerState>>,
-) -> StatusCode {
+async fn clear_requests(State(state): State<Arc<ServerState>>) -> StatusCode {
     for entry in state.captures.iter() {
         let mut queue = entry.value().lock().await;
         queue.clear();
@@ -131,9 +127,7 @@ async fn replay_request(
     let client = reqwest::Client::new();
     let url = format!(
         "https://{}.{}{}",
-        session.subdomain,
-        state.config.server.domain,
-        cap.req_url
+        session.subdomain, state.config.server.domain, cap.req_url
     );
     let method: reqwest::Method = cap.req_method.parse().unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, &url);
@@ -150,7 +144,9 @@ async fn replay_request(
     match req.send().await {
         Ok(_resp) => {
             let new_id = uuid::Uuid::new_v4().to_string();
-            Ok(Json(ReplayResult { new_request_id: new_id }))
+            Ok(Json(ReplayResult {
+                new_request_id: new_id,
+            }))
         }
         Err(e) => {
             tracing::warn!("Replay failed: {}", e);
@@ -163,22 +159,18 @@ async fn event_stream(
     State(state): State<Arc<ServerState>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.inspect_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        match result {
-            Ok(event) => {
-                let data = serde_json::to_string(&event).ok()?;
-                Some(Ok(Event::default().data(data)))
-            }
-            Err(_) => None,
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let data = serde_json::to_string(&event).ok()?;
+            Some(Ok(Event::default().data(data)))
         }
+        Err(_) => None,
     });
 
     Sse::new(stream)
 }
 
-async fn server_status(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+async fn server_status(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let active_tunnels = state.tunnels.len();
     let tcp_tunnels = state.tcp_tunnels.len();
 

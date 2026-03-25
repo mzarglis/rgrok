@@ -86,7 +86,9 @@ where
         if let Some(offset) = body_start {
             if offset < resp_data.len() {
                 let body_len = (resp_data.len() - offset).min(1_048_576);
-                cap.resp_body = Some(Bytes::copy_from_slice(&resp_data[offset..offset + body_len]));
+                cap.resp_body = Some(Bytes::copy_from_slice(
+                    &resp_data[offset..offset + body_len],
+                ));
             }
         }
         cap.duration_ms = Some(start.elapsed().as_millis() as u64);
@@ -194,8 +196,14 @@ mod tests {
         assert_eq!(cap.req_method, "GET");
         assert_eq!(cap.req_url, "/api/test");
         assert_eq!(cap.req_headers.len(), 2);
-        assert_eq!(cap.req_headers[0], ("Host".to_string(), "example.com".to_string()));
-        assert_eq!(cap.req_headers[1], ("Accept".to_string(), "text/html".to_string()));
+        assert_eq!(
+            cap.req_headers[0],
+            ("Host".to_string(), "example.com".to_string())
+        );
+        assert_eq!(
+            cap.req_headers[1],
+            ("Accept".to_string(), "text/html".to_string())
+        );
         assert!(cap.req_body.is_none());
         assert!(cap.resp_status.is_none());
     }
@@ -245,7 +253,10 @@ mod tests {
         let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Custom: value\r\n\r\n";
         let headers = parse_response_headers(resp);
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0], ("Content-Type".to_string(), "application/json".to_string()));
+        assert_eq!(
+            headers[0],
+            ("Content-Type".to_string(), "application/json".to_string())
+        );
         assert_eq!(headers[1], ("X-Custom".to_string(), "value".to_string()));
     }
 
@@ -284,8 +295,7 @@ mod tests {
         let port = tmp.local_addr().unwrap().port();
         drop(tmp); // stop listening
 
-        let result =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+        let result = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
         assert!(result.is_err(), "Connection to closed port should fail");
     }
 

@@ -103,6 +103,7 @@ impl ClientConfig {
     }
 
     /// Get the default config path
+    #[allow(dead_code)]
     pub fn default_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -276,9 +277,6 @@ format = "compact"
     #[test]
     fn test_parse_auth_multiple_colons() {
         let result = parse_auth("user:pass:extra");
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass:extra".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pass:extra".to_string())));
     }
 }

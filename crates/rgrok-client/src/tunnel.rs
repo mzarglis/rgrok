@@ -32,10 +32,7 @@ pub async fn run(config: ClientConfig, tunnel_cfg: TunnelConfig) -> anyhow::Resu
     }
 
     // Use wss:// by default, fall back to ws:// if no TLS
-    let server_url = format!(
-        "ws://{}:{}/tunnel",
-        config.server.host, config.server.port
-    );
+    let server_url = format!("ws://{}:{}/tunnel", config.server.host, config.server.port);
 
     // Connect with exponential backoff
     let ws = connect_with_retry(&server_url).await?;
@@ -230,8 +227,7 @@ async fn open_proxy_stream(
     };
 
     // Bridge yamux stream <-> local service
-    let result =
-        local_proxy::bridge_streams(&mut compat_stream, &mut local, inspect, &stats).await;
+    let result = local_proxy::bridge_streams(&mut compat_stream, &mut local, inspect, &stats).await;
 
     // Send log entry to dashboard (best-effort, from captured request data)
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -249,9 +245,7 @@ async fn open_proxy_stream(
 async fn connect_with_retry(
     url: &str,
 ) -> anyhow::Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
     let mut delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(60);
@@ -306,16 +300,10 @@ mod tests {
 
         // Build an in-memory yamux client/server pair
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let client_conn = yamux::Connection::new(
-            client_io.compat(),
-            yamux_config(),
-            yamux::Mode::Client,
-        );
-        let server_conn = yamux::Connection::new(
-            server_io.compat(),
-            yamux_config(),
-            yamux::Mode::Server,
-        );
+        let client_conn =
+            yamux::Connection::new(client_io.compat(), yamux_config(), yamux::Mode::Client);
+        let server_conn =
+            yamux::Connection::new(server_io.compat(), yamux_config(), yamux::Mode::Server);
         let (client_ctrl, _client_inbound, _client_driver) = spawn_yamux_driver(client_conn);
         let (_server_ctrl, mut server_rx, _server_driver) = spawn_yamux_driver(server_conn);
 
@@ -343,13 +331,10 @@ mod tests {
 
         // Read and verify the 4-byte correlation_id header
         let mut header = [0u8; 4];
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            data_stream.read_exact(&mut header),
-        )
-        .await
-        .expect("timed out reading header")
-        .expect("failed to read header bytes");
+        tokio::time::timeout(Duration::from_secs(2), data_stream.read_exact(&mut header))
+            .await
+            .expect("timed out reading header")
+            .expect("failed to read header bytes");
 
         assert_eq!(
             u32::from_be_bytes(header),
@@ -377,16 +362,10 @@ mod tests {
         });
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let client_conn = yamux::Connection::new(
-            client_io.compat(),
-            yamux_config(),
-            yamux::Mode::Client,
-        );
-        let server_conn = yamux::Connection::new(
-            server_io.compat(),
-            yamux_config(),
-            yamux::Mode::Server,
-        );
+        let client_conn =
+            yamux::Connection::new(client_io.compat(), yamux_config(), yamux::Mode::Client);
+        let server_conn =
+            yamux::Connection::new(server_io.compat(), yamux_config(), yamux::Mode::Server);
         let (client_ctrl, _client_inbound, _client_driver) = spawn_yamux_driver(client_conn);
         let (_server_ctrl, mut server_rx, _server_driver) = spawn_yamux_driver(server_conn);
 
@@ -408,20 +387,16 @@ mod tests {
         // Collect all inbound streams and map each to its header value
         let mut received_ids = Vec::new();
         for _ in 0..ids.len() {
-            let mut stream =
-                tokio::time::timeout(Duration::from_secs(2), server_rx.recv())
-                    .await
-                    .expect("timed out waiting for inbound stream")
-                    .expect("server_rx closed unexpectedly");
+            let mut stream = tokio::time::timeout(Duration::from_secs(2), server_rx.recv())
+                .await
+                .expect("timed out waiting for inbound stream")
+                .expect("server_rx closed unexpectedly");
 
             let mut header = [0u8; 4];
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.read_exact(&mut header),
-            )
-            .await
-            .expect("timed out reading header")
-            .expect("failed to read header bytes");
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut header))
+                .await
+                .expect("timed out reading header")
+                .expect("failed to read header bytes");
 
             received_ids.push(u32::from_be_bytes(header));
         }
@@ -430,7 +405,10 @@ mod tests {
         received_ids.sort_unstable();
         let mut expected: Vec<u32> = ids.to_vec();
         expected.sort_unstable();
-        assert_eq!(received_ids, expected, "each stream must carry its own correlation_id");
+        assert_eq!(
+            received_ids, expected,
+            "each stream must carry its own correlation_id"
+        );
     }
 
     #[tokio::test]

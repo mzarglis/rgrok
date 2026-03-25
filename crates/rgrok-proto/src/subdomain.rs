@@ -1,22 +1,19 @@
 use rand::Rng;
 
 const ADJECTIVES: &[&str] = &[
-    "amber", "brave", "calm", "dark", "eager", "fair", "glad", "hale", "iron",
-    "just", "keen", "lush", "mild", "neat", "open", "pale", "rare", "sage",
-    "tall", "vast", "warm", "bold", "cool", "deep", "easy", "fast", "gold",
-    "high", "jade", "kind", "lean", "moss", "nova", "opal", "pure", "ruby",
-    "silk", "teal", "true", "vivid", "wise", "airy", "blue", "crisp", "dusk",
-    "epic", "free", "gray", "hazy", "iced",
+    "amber", "brave", "calm", "dark", "eager", "fair", "glad", "hale", "iron", "just", "keen",
+    "lush", "mild", "neat", "open", "pale", "rare", "sage", "tall", "vast", "warm", "bold", "cool",
+    "deep", "easy", "fast", "gold", "high", "jade", "kind", "lean", "moss", "nova", "opal", "pure",
+    "ruby", "silk", "teal", "true", "vivid", "wise", "airy", "blue", "crisp", "dusk", "epic",
+    "free", "gray", "hazy", "iced",
 ];
 
 const NOUNS: &[&str] = &[
-    "atlas", "beam", "coast", "dawn", "echo", "forge", "glow", "haven",
-    "inlet", "jewel", "knoll", "lake", "mesa", "north", "orbit", "pine",
-    "quest", "ridge", "shore", "tide", "unity", "vale", "wave", "yield",
-    "zenith", "arch", "brook", "cliff", "delta", "field", "grove", "hill",
-    "isle", "jade", "keep", "leaf", "marsh", "nest", "oak", "peak",
-    "reef", "storm", "trail", "umber", "vine", "wind", "apex", "bay",
-    "cove", "dune",
+    "atlas", "beam", "coast", "dawn", "echo", "forge", "glow", "haven", "inlet", "jewel", "knoll",
+    "lake", "mesa", "north", "orbit", "pine", "quest", "ridge", "shore", "tide", "unity", "vale",
+    "wave", "yield", "zenith", "arch", "brook", "cliff", "delta", "field", "grove", "hill", "isle",
+    "jade", "keep", "leaf", "marsh", "nest", "oak", "peak", "reef", "storm", "trail", "umber",
+    "vine", "wind", "apex", "bay", "cove", "dune",
 ];
 
 /// Generates a memorable, URL-safe subdomain like "amber-atlas-7f3a"
@@ -42,15 +39,26 @@ pub fn validate_subdomain(subdomain: &str) -> Result<(), String> {
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err("subdomain may only contain lowercase letters, digits, and hyphens".to_string());
+        return Err(
+            "subdomain may only contain lowercase letters, digits, and hyphens".to_string(),
+        );
     }
     if subdomain.starts_with('-') || subdomain.ends_with('-') {
         return Err("subdomain must not start or end with a hyphen".to_string());
     }
 
     const RESERVED: &[&str] = &[
-        "www", "api", "mail", "smtp", "ftp", "admin", "dashboard", "status",
-        "health", "metrics", "internal",
+        "www",
+        "api",
+        "mail",
+        "smtp",
+        "ftp",
+        "admin",
+        "dashboard",
+        "status",
+        "health",
+        "metrics",
+        "internal",
     ];
     if RESERVED.contains(&subdomain) {
         return Err(format!("subdomain '{}' is reserved", subdomain));

@@ -31,6 +31,7 @@ pub struct ServerState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Hot-reloadable TLS config (watched by proxy listeners)
     pub tls_config: tokio::sync::watch::Sender<Option<Arc<rustls::ServerConfig>>>,
+    #[allow(dead_code)]
     pub tls_config_rx: tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
 }
 
@@ -59,6 +60,7 @@ impl ServerState {
     }
 
     /// Reload the jti blocklist from a new config
+    #[allow(dead_code)]
     pub async fn reload_revoked_jtis(&self, jtis: &[String]) {
         let mut blocklist = self.revoked_jtis.write().await;
         blocklist.clear();
@@ -111,11 +113,7 @@ impl ServerState {
     }
 
     /// Register a TCP tunnel on a specific port
-    pub fn register_tcp_tunnel(
-        &self,
-        port: u16,
-        session: Arc<TunnelSession>,
-    ) {
+    pub fn register_tcp_tunnel(&self, port: u16, session: Arc<TunnelSession>) {
         self.tcp_tunnels.insert(port, session);
     }
 
@@ -142,6 +140,7 @@ impl ServerState {
 /// Represents an active tunnel session from a connected client
 pub struct TunnelSession {
     pub id: String,
+    #[allow(dead_code)]
     pub tunnel_type: TunnelType,
     pub subdomain: String,
     pub basic_auth: Option<BasicAuthConfig>,
@@ -324,7 +323,9 @@ mod tests {
     #[test]
     fn test_unregister_tunnel_decrements_metrics() {
         let state = ServerState::new(make_test_config(10));
-        state.register_tunnel(make_tunnel_session("metrics-test")).unwrap();
+        state
+            .register_tunnel(make_tunnel_session("metrics-test"))
+            .unwrap();
         assert_eq!(state.metrics.active_tunnels.get(), 1);
         state.unregister_tunnel("metrics-test");
         assert_eq!(state.metrics.active_tunnels.get(), 0);

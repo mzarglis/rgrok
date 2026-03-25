@@ -9,8 +9,8 @@ mod tls;
 mod tunnel_manager;
 mod web_ui;
 
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tokio_rustls::TlsAcceptor;
@@ -182,8 +182,8 @@ async fn main() -> anyhow::Result<()> {
 fn init_tracing(config: &Config) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     match config.logging.format.as_str() {
         "json" => {
@@ -193,9 +193,7 @@ fn init_tracing(config: &Config) {
                 .init();
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
 }
@@ -212,7 +210,9 @@ async fn reload_on_signal(state: Arc<ServerState>, config_path: PathBuf) {
         info!("SIGHUP received — reloading config");
         match Config::load(&config_path) {
             Ok(new_config) => {
-                state.reload_revoked_jtis(&new_config.auth.revoked_jtis).await;
+                state
+                    .reload_revoked_jtis(&new_config.auth.revoked_jtis)
+                    .await;
                 info!(
                     revoked_count = new_config.auth.revoked_jtis.len(),
                     "Revoked JTI blocklist reloaded"
@@ -244,8 +244,10 @@ mod tests {
     use std::time::Duration;
 
     use rgrok_proto::messages::*;
-    use rgrok_proto::transport::{read_msg_from_stream, write_msg_to_stream, yamux_config, WsCompat};
     use rgrok_proto::spawn_yamux_driver;
+    use rgrok_proto::transport::{
+        read_msg_from_stream, write_msg_to_stream, yamux_config, WsCompat,
+    };
 
     const TEST_SECRET: &str = "test-secret-that-is-definitely-32-chars!";
 
@@ -317,9 +319,10 @@ mod tests {
         (port, state)
     }
 
-    async fn connect_ws(port: u16) -> tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    > {
+    async fn connect_ws(
+        port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
         let url = format!("ws://127.0.0.1:{}/", port);
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         ws
@@ -374,7 +377,7 @@ mod tests {
         // Server sends AuthErr then closes — we may get the message or EOF
         match read_msg_from_stream::<ServerMsg>(&mut ctrl).await {
             Ok(ServerMsg::AuthErr { .. }) => {} // Got the rejection message
-            Err(_) => {} // Connection closed before we read — also valid
+            Err(_) => {}                        // Connection closed before we read — also valid
             Ok(other) => panic!("Expected AuthErr or EOF, got {:?}", other),
         }
     }
@@ -619,7 +622,8 @@ mod tests {
         let mut buf = [0u8; 512];
         let n = data_stream.read(&mut buf).await.unwrap();
         assert_eq!(
-            &buf[..n], request_data,
+            &buf[..n],
+            request_data,
             "Request bytes should reach the client"
         );
 
@@ -629,7 +633,8 @@ mod tests {
 
         let n = server_proxy.read(&mut buf).await.unwrap();
         assert_eq!(
-            &buf[..n], response_data,
+            &buf[..n],
+            response_data,
             "Response bytes should reach the server"
         );
     }
@@ -724,8 +729,7 @@ mod tests {
                 let ws = connect_ws(port).await;
 
                 let ws_compat = WsCompat::new(ws);
-                let mux =
-                    yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
+                let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
                 let (control, _rx, _handle) = spawn_yamux_driver(mux);
 
                 let mut ctrl = control.open_stream().await.unwrap();
@@ -835,7 +839,11 @@ mod tests {
 
         match read_msg_from_stream::<ServerMsg>(&mut ctrl).await {
             Ok(ServerMsg::AuthErr { reason }) => {
-                assert!(reason.contains("revoked"), "Expected revocation message, got: {}", reason);
+                assert!(
+                    reason.contains("revoked"),
+                    "Expected revocation message, got: {}",
+                    reason
+                );
             }
             Err(_) => {} // Connection closed — also valid
             Ok(other) => panic!("Expected AuthErr for revoked token, got {:?}", other),

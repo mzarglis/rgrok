@@ -39,9 +39,7 @@ pub fn load_tls_config(config: &Config) -> anyhow::Result<Arc<rustls::ServerConf
 /// 4. Finalize order with CSR
 /// 5. Download and save cert chain
 /// 6. Clean up TXT records
-pub async fn provision_wildcard_cert(
-    config: &Config,
-) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     use instant_acme::{
         Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
         OrderStatus,
@@ -248,12 +246,11 @@ fn load_from_files(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<rustls
     let cert_data = std::fs::read(cert_path)?;
     let key_data = std::fs::read(key_path)?;
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_data[..])
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut &cert_data[..]).collect::<Result<Vec<_>, _>>()?;
 
-    let key = rustls_pemfile::private_key(&mut &key_data[..])?.ok_or_else(|| {
-        anyhow::anyhow!("no private key found in {}", key_path)
-    })?;
+    let key = rustls_pemfile::private_key(&mut &key_data[..])?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path))?;
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -278,9 +275,7 @@ fn generate_self_signed(domain: &str) -> anyhow::Result<Arc<rustls::ServerConfig
     let cert = cert_params.self_signed(&key_pair)?;
 
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        key_pair.serialize_der(),
-    ));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -290,11 +285,7 @@ fn generate_self_signed(domain: &str) -> anyhow::Result<Arc<rustls::ServerConfig
 }
 
 /// Save cert and key to disk
-pub fn save_cert(
-    cert_pem: &str,
-    key_pem: &str,
-    cert_dir: &str,
-) -> anyhow::Result<()> {
+pub fn save_cert(cert_pem: &str, key_pem: &str, cert_dir: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(cert_dir)?;
     let cert_path = PathBuf::from(cert_dir).join("fullchain.pem");
     let key_path = PathBuf::from(cert_dir).join("privkey.pem");
@@ -332,7 +323,8 @@ pub async fn cert_renewal_loop(state: Arc<ServerState>) {
         interval.tick().await;
 
         // Check if Cloudflare is configured (needed for ACME DNS-01)
-        if state.config.cloudflare.api_token.is_empty() || state.config.cloudflare.zone_id.is_empty()
+        if state.config.cloudflare.api_token.is_empty()
+            || state.config.cloudflare.zone_id.is_empty()
         {
             continue;
         }
@@ -373,8 +365,8 @@ pub async fn cert_renewal_loop(state: Arc<ServerState>) {
 /// Check if a PEM certificate file expires within the given duration.
 fn cert_expires_within(cert_path: &PathBuf, threshold: Duration) -> anyhow::Result<bool> {
     let cert_data = std::fs::read(cert_path)?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_data[..])
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut &cert_data[..]).collect::<Result<Vec<_>, _>>()?;
 
     let cert = certs
         .first()

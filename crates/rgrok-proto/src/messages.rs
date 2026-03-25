@@ -5,10 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     /// Authenticate and request a tunnel
-    Auth {
-        token: String,
-        version: String,
-    },
+    Auth { token: String, version: String },
     /// Request a new tunnel
     TunnelRequest {
         id: String,
@@ -38,7 +35,10 @@ pub enum ServerMsg {
         tunnel_type: TunnelType,
     },
     /// Server asking client to open a new proxy stream for an incoming request
-    StreamOpen { correlation_id: u32, tunnel_id: String },
+    StreamOpen {
+        correlation_id: u32,
+        tunnel_id: String,
+    },
     /// Heartbeat response
     Pong { seq: u64 },
     /// Server-initiated error
@@ -108,7 +108,9 @@ mod tests {
         let decoded: ServerMsg = decode_msg(&encoded).unwrap();
         match decoded {
             ServerMsg::TunnelAck {
-                id, public_url, tunnel_type,
+                id,
+                public_url,
+                tunnel_type,
             } => {
                 assert_eq!(id, "t1");
                 assert_eq!(public_url, "https://test.tunnel.example.com");
@@ -122,7 +124,9 @@ mod tests {
     fn test_tunnel_request_roundtrip() {
         let msg = ClientMsg::TunnelRequest {
             id: "req-1".to_string(),
-            tunnel_type: TunnelType::Tcp { remote_port: Some(15432) },
+            tunnel_type: TunnelType::Tcp {
+                remote_port: Some(15432),
+            },
             subdomain: Some("myapp".to_string()),
             basic_auth: Some(BasicAuthConfig {
                 username: "admin".to_string(),
@@ -137,9 +141,16 @@ mod tests {
         let encoded = encode_msg(&msg).unwrap();
         let decoded: ClientMsg = decode_msg(&encoded).unwrap();
         match decoded {
-            ClientMsg::TunnelRequest { id, tunnel_type, .. } => {
+            ClientMsg::TunnelRequest {
+                id, tunnel_type, ..
+            } => {
                 assert_eq!(id, "req-1");
-                assert_eq!(tunnel_type, TunnelType::Tcp { remote_port: Some(15432) });
+                assert_eq!(
+                    tunnel_type,
+                    TunnelType::Tcp {
+                        remote_port: Some(15432)
+                    }
+                );
             }
             _ => panic!("wrong variant"),
         }

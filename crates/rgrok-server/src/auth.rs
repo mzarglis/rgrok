@@ -12,7 +12,11 @@ pub struct TokenClaims {
 }
 
 /// Generate a signed JWT auth token
-pub fn generate_token(secret: &str, label: &str, expires_in: Option<u64>) -> anyhow::Result<String> {
+pub fn generate_token(
+    secret: &str,
+    label: &str,
+    expires_in: Option<u64>,
+) -> anyhow::Result<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -36,9 +40,7 @@ pub fn generate_token(secret: &str, label: &str, expires_in: Option<u64>) -> any
 
 /// Validate a JWT auth token, returning the claims if valid
 pub fn validate_token(token: &str, secret: &str) -> anyhow::Result<TokenClaims> {
-    let raw_token = token
-        .strip_prefix("rgrok_tok_")
-        .unwrap_or(token);
+    let raw_token = token.strip_prefix("rgrok_tok_").unwrap_or(token);
 
     let mut validation = Validation::default();
     validation.required_spec_claims.clear();

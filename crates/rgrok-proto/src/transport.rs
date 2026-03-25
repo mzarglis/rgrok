@@ -50,7 +50,10 @@ impl YamuxTransport {
 #[async_trait::async_trait]
 impl TunnelTransport for YamuxTransport {
     async fn open_stream(&self) -> anyhow::Result<Box<dyn TunnelStream>> {
-        let stream = self.control.open_stream().await
+        let stream = self
+            .control
+            .open_stream()
+            .await
             .map_err(|e| anyhow::anyhow!("yamux open_stream: {}", e))?;
         // Wrap yamux::Stream (futures AsyncRead/Write) into tokio AsyncRead/Write
         let compat = tokio_util::compat::FuturesAsyncReadCompatExt::compat(stream);
@@ -59,7 +62,9 @@ impl TunnelTransport for YamuxTransport {
 
     async fn accept_stream(&self) -> anyhow::Result<Box<dyn TunnelStream>> {
         let mut rx = self.inbound_rx.lock().await;
-        let stream = rx.recv().await
+        let stream = rx
+            .recv()
+            .await
             .ok_or_else(|| anyhow::anyhow!("yamux connection closed"))?;
         let compat = tokio_util::compat::FuturesAsyncReadCompatExt::compat(stream);
         Ok(Box::new(compat))
@@ -125,9 +130,7 @@ where
                 }
                 Poll::Ready(Ok(len))
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
             Poll::Ready(None) => Poll::Ready(Ok(0)),
             Poll::Pending => Poll::Pending,
         }
@@ -159,19 +162,13 @@ where
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner
             .poll_flush_unpin(cx)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner
             .poll_close_unpin(cx)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -352,16 +349,10 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
-        let client_conn = yamux::Connection::new(
-            client_io.compat(),
-            yamux_config(),
-            yamux::Mode::Client,
-        );
-        let server_conn = yamux::Connection::new(
-            server_io.compat(),
-            yamux_config(),
-            yamux::Mode::Server,
-        );
+        let client_conn =
+            yamux::Connection::new(client_io.compat(), yamux_config(), yamux::Mode::Client);
+        let server_conn =
+            yamux::Connection::new(server_io.compat(), yamux_config(), yamux::Mode::Server);
 
         let (client_ctrl, _client_rx, client_handle) = spawn_yamux_driver(client_conn);
         let (_server_ctrl, mut server_rx, server_handle) = spawn_yamux_driver(server_conn);
@@ -394,7 +385,9 @@ mod tests {
         let (mut client_stream, mut server_stream, _h1, _h2) = open_yamux_stream_pair().await;
 
         let original = crate::messages::ClientMsg::Ping { seq: 42 };
-        write_msg_to_stream(&mut client_stream, &original).await.unwrap();
+        write_msg_to_stream(&mut client_stream, &original)
+            .await
+            .unwrap();
 
         let decoded: crate::messages::ClientMsg =
             read_msg_from_stream(&mut server_stream).await.unwrap();
@@ -412,7 +405,9 @@ mod tests {
             session_id: "sess-123".to_string(),
         };
         // Server writes, client reads (reverse direction on same stream pair)
-        write_msg_to_stream(&mut server_stream, &original).await.unwrap();
+        write_msg_to_stream(&mut server_stream, &original)
+            .await
+            .unwrap();
 
         let decoded: crate::messages::ServerMsg =
             read_msg_from_stream(&mut client_stream).await.unwrap();
@@ -452,10 +447,7 @@ mod tests {
     /// A mock WebSocket stream that yields pre-loaded Binary messages.
     struct MockWsStream {
         messages: std::collections::VecDeque<
-            Result<
-                tokio_tungstenite::tungstenite::Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
+            Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
         >,
         sent: Vec<Vec<u8>>,
     }
@@ -464,11 +456,7 @@ mod tests {
         fn new(data: Vec<Vec<u8>>) -> Self {
             let messages = data
                 .into_iter()
-                .map(|d| {
-                    Ok(tokio_tungstenite::tungstenite::Message::Binary(
-                        d.into(),
-                    ))
-                })
+                .map(|d| Ok(tokio_tungstenite::tungstenite::Message::Binary(d.into())))
                 .collect();
             Self {
                 messages,
@@ -478,15 +466,10 @@ mod tests {
     }
 
     impl futures::Stream for MockWsStream {
-        type Item = Result<
-            tokio_tungstenite::tungstenite::Message,
-            tokio_tungstenite::tungstenite::Error,
-        >;
+        type Item =
+            Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>;
 
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             match self.messages.pop_front() {
                 Some(msg) => Poll::Ready(Some(msg)),
                 None => Poll::Ready(None),
@@ -539,7 +522,9 @@ mod tests {
         let mut collected = Vec::new();
         let mut small_buf = [0u8; 4];
         loop {
-            let n = futures::AsyncReadExt::read(&mut ws, &mut small_buf).await.unwrap();
+            let n = futures::AsyncReadExt::read(&mut ws, &mut small_buf)
+                .await
+                .unwrap();
             if n == 0 {
                 break;
             }
@@ -559,7 +544,9 @@ mod tests {
         let mut collected = Vec::new();
         let mut buf = [0u8; 64];
         loop {
-            let n = futures::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+            let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
+                .await
+                .unwrap();
             if n == 0 {
                 break;
             }
@@ -578,7 +565,9 @@ mod tests {
         let mut ws = WsCompat::new(mock);
 
         let mut buf = [0u8; 3];
-        let n = futures::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+        let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(n, 3);
         assert_eq!(&buf[..], &data[..]);
         // Internal buffer should be empty now
@@ -591,7 +580,9 @@ mod tests {
         let mut ws = WsCompat::new(mock);
 
         let payload = b"hello world";
-        let n = futures::AsyncWriteExt::write(&mut ws, payload).await.unwrap();
+        let n = futures::AsyncWriteExt::write(&mut ws, payload)
+            .await
+            .unwrap();
         assert_eq!(n, payload.len());
 
         // Verify the mock captured the binary message
@@ -610,7 +601,9 @@ mod tests {
         let mut ws = WsCompat::new(mock);
 
         let mut buf = [0u8; 32];
-        let n = futures::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+        let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -622,11 +615,7 @@ mod tests {
     async fn test_yamux_transport_kind() {
         let (_ctrl, rx, _h) = {
             let (io1, _io2) = tokio::io::duplex(1024);
-            let conn = yamux::Connection::new(
-                io1.compat(),
-                yamux_config(),
-                yamux::Mode::Client,
-            );
+            let conn = yamux::Connection::new(io1.compat(), yamux_config(), yamux::Mode::Client);
             spawn_yamux_driver(conn)
         };
 
@@ -639,16 +628,10 @@ mod tests {
     fn setup_transport_pair() -> (YamuxTransport, YamuxTransport) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
-        let client_conn = yamux::Connection::new(
-            client_io.compat(),
-            yamux_config(),
-            yamux::Mode::Client,
-        );
-        let server_conn = yamux::Connection::new(
-            server_io.compat(),
-            yamux_config(),
-            yamux::Mode::Server,
-        );
+        let client_conn =
+            yamux::Connection::new(client_io.compat(), yamux_config(), yamux::Mode::Client);
+        let server_conn =
+            yamux::Connection::new(server_io.compat(), yamux_config(), yamux::Mode::Server);
 
         let (client_ctrl, client_rx, _h1) = spawn_yamux_driver(client_conn);
         let (server_ctrl, server_rx, _h2) = spawn_yamux_driver(server_conn);
@@ -669,7 +652,10 @@ mod tests {
 
         // Write data (triggers SYN) while server accepts the new stream
         let accept_task = tokio::spawn(async move {
-            server_transport.accept_stream().await.expect("accept failed")
+            server_transport
+                .accept_stream()
+                .await
+                .expect("accept failed")
         });
 
         client_stream.write_all(b"hello from client").await.unwrap();
@@ -691,7 +677,10 @@ mod tests {
 
         // Write data (triggers SYN) while client accepts the new stream
         let accept_task = tokio::spawn(async move {
-            client_transport.accept_stream().await.expect("accept failed")
+            client_transport
+                .accept_stream()
+                .await
+                .expect("accept failed")
         });
 
         server_stream.write_all(b"server says hi").await.unwrap();

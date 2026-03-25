@@ -105,7 +105,11 @@ pub fn spawn_dashboard(stats: Arc<TunnelStats>) -> mpsc::UnboundedSender<Request
     println!("╠{}╣", border);
     println!(
         "║  {:<8}{:<8}{:<18}{:<8}{:<width2$}║",
-        "Time", "Method", "URL", "Status", "Duration",
+        "Time",
+        "Method",
+        "URL",
+        "Status",
+        "Duration",
         width2 = width - 44
     );
     println!("╚{}╝", border);
