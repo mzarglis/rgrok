@@ -147,6 +147,50 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig {
+                domain: "tunnel.example.com".to_string(),
+                control_port: default_control_port(),
+                https_port: default_https_port(),
+                http_port: default_http_port(),
+                tcp_port_range: default_tcp_port_range(),
+                max_tunnels: default_max_tunnels(),
+                tunnel_idle_timeout_secs: default_tunnel_idle_timeout(),
+                metrics_port: default_metrics_port(),
+            },
+            auth: AuthConfig {
+                secret: "a".repeat(32),
+                tokens: vec![],
+                revoked_jtis: vec![],
+            },
+            tls: TlsConfig {
+                acme_env: default_acme_env(),
+                acme_email: String::new(),
+                cert_dir: default_cert_dir(),
+                cert_file: None,
+                key_file: None,
+            },
+            cloudflare: CloudflareConfig {
+                api_token: String::new(),
+                zone_id: String::new(),
+                dns_ttl: default_dns_ttl(),
+                per_tunnel_dns: false,
+            },
+            inspect: InspectConfig {
+                ui_port: 0,
+                ui_bind: default_ui_bind(),
+                buffer_size: default_buffer_size(),
+            },
+            logging: LoggingConfig {
+                level: default_log_level(),
+                format: default_log_format(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,49 +340,5 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
     fn test_default_impl_validates() {
         let config = Config::default();
         config.validate().unwrap();
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig {
-                domain: "tunnel.example.com".to_string(),
-                control_port: default_control_port(),
-                https_port: default_https_port(),
-                http_port: default_http_port(),
-                tcp_port_range: default_tcp_port_range(),
-                max_tunnels: default_max_tunnels(),
-                tunnel_idle_timeout_secs: default_tunnel_idle_timeout(),
-                metrics_port: default_metrics_port(),
-            },
-            auth: AuthConfig {
-                secret: "a".repeat(32),
-                tokens: vec![],
-                revoked_jtis: vec![],
-            },
-            tls: TlsConfig {
-                acme_env: default_acme_env(),
-                acme_email: String::new(),
-                cert_dir: default_cert_dir(),
-                cert_file: None,
-                key_file: None,
-            },
-            cloudflare: CloudflareConfig {
-                api_token: String::new(),
-                zone_id: String::new(),
-                dns_ttl: default_dns_ttl(),
-                per_tunnel_dns: false,
-            },
-            inspect: InspectConfig {
-                ui_port: 0,
-                ui_bind: default_ui_bind(),
-                buffer_size: default_buffer_size(),
-            },
-            logging: LoggingConfig {
-                level: default_log_level(),
-                format: default_log_format(),
-            },
-        }
     }
 }

@@ -352,12 +352,8 @@ mod tests {
         let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_port = local_listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            loop {
-                if let Ok((_stream, _)) = local_listener.accept().await {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                } else {
-                    break;
-                }
+            while let Ok((_stream, _)) = local_listener.accept().await {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
 

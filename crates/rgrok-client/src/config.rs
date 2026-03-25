@@ -153,7 +153,7 @@ mod tests {
         // not the serde default functions. The serde defaults only kick in
         // when deserializing from TOML with missing fields.
         assert_eq!(config.defaults.inspect_port, 0);
-        assert_eq!(config.defaults.inspect, false);
+        assert!(!config.defaults.inspect);
         assert_eq!(config.defaults.max_body_bytes, 0);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "pretty");
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(deserialized.server.port, 9999);
         assert_eq!(deserialized.auth.token, "tok_abc123");
         assert_eq!(deserialized.defaults.inspect_port, 5050);
-        assert_eq!(deserialized.defaults.inspect, false);
+        assert!(!deserialized.defaults.inspect);
         assert_eq!(deserialized.defaults.max_body_bytes, 2_097_152);
         assert_eq!(deserialized.logging.level, "debug");
         assert_eq!(deserialized.logging.format, "json");
@@ -211,7 +211,7 @@ token = ""
         // DefaultsSection's derive(Default) (Rust Default: 0/false),
         // NOT the per-field serde default functions.
         assert_eq!(config.defaults.inspect_port, 0);
-        assert_eq!(config.defaults.inspect, false);
+        assert!(!config.defaults.inspect);
         assert_eq!(config.defaults.max_body_bytes, 0);
         // logging section should be fully defaulted
         assert_eq!(config.logging.level, "info");
@@ -243,7 +243,7 @@ format = "compact"
         assert_eq!(config.server.port, 1234);
         assert_eq!(config.auth.token, "secret-token");
         assert_eq!(config.defaults.inspect_port, 8080);
-        assert_eq!(config.defaults.inspect, false);
+        assert!(!config.defaults.inspect);
         assert_eq!(config.defaults.max_body_bytes, 512);
         assert_eq!(config.logging.level, "trace");
         assert_eq!(config.logging.format, "compact");

@@ -450,6 +450,7 @@ mod tests {
     }
 
     impl MockWsStream {
+        #[allow(clippy::result_large_err)]
         fn new(data: Vec<Vec<u8>>) -> Self {
             let messages = data
                 .into_iter()

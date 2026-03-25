@@ -686,12 +686,7 @@ mod tests {
 
         // The control stream should close within the 5s drain period
         let drain_result = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match read_msg_from_stream::<ServerMsg>(&mut ctrl).await {
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
+            while read_msg_from_stream::<ServerMsg>(&mut ctrl).await.is_ok() {}
         })
         .await;
 
