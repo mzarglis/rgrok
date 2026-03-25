@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rgrok — Inspection UI</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e1e4ed; --muted: #8b8fa3; --accent: #6c7aff;
+    --green: #4caf50; --red: #f44336; --yellow: #ffc107; --blue: #2196f3;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  .toolbar input { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 10px; border-radius: 4px; font-size: 13px; width: 240px; }
+  .btn { background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  .btn:hover { border-color: var(--accent); }
+  .btn-danger { color: var(--red); }
+  .status-bar { background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 8px 20px; font-size: 12px; color: var(--muted); display: flex; gap: 24px; }
+  .status-bar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    display: inline-block; margin-right: 6px; }
+  main { flex: 1; display: flex; overflow: hidden; }
+  .request-list { width: 400px; border-right: 1px solid var(--border); overflow-y: auto; }
+  .request-item { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer;
+    display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  .request-item:hover, .request-item.active { background: var(--surface); }
+  .method { font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 3px;
+    min-width: 44px; text-align: center; }
+  .method-GET { background: rgba(76,175,80,0.15); color: var(--green); }
+  .method-POST { background: rgba(33,150,243,0.15); color: var(--blue); }
+  .method-PUT { background: rgba(255,193,7,0.15); color: var(--yellow); }
+  .method-DELETE { background: rgba(244,67,54,0.15); color: var(--red); }
+  .method-PATCH { background: rgba(108,122,255,0.15); color: var(--accent); }
+  .req-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .req-status { font-size: 12px; font-weight: 600; }
+  .req-status.s2xx { color: var(--green); }
+  .req-status.s3xx { color: var(--blue); }
+  .req-status.s4xx { color: var(--yellow); }
+  .req-status.s5xx { color: var(--red); }
+  .req-duration { color: var(--muted); font-size: 11px; min-width: 40px; text-align: right; }
+  .detail-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .detail-empty { flex: 1; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 14px; }
+  .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .tab { padding: 10px 16px; font-size: 13px; cursor: pointer; color: var(--muted);
+    border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .tab-content { flex: 1; overflow-y: auto; padding: 16px; font-size: 13px; }
+  .detail-header { display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  table.headers { width: 100%; border-collapse: collapse; }
+  table.headers td { padding: 4px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.headers td:first-child { color: var(--accent); font-weight: 600; white-space: nowrap; width: 200px; }
+  pre.body { background: var(--surface); padding: 12px; border-radius: 4px; overflow-x: auto;
+    white-space: pre-wrap; word-break: break-all; }
+  .empty-list { padding: 40px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>rgrok</span> inspect</h1>
+  <div class="toolbar">
+    <input type="text" id="filter" placeholder="Filter by path, method, status...">
+    <button class="btn btn-danger" onclick="clearAll()">Clear</button>
+  </div>
+</header>
+<div class="status-bar" id="statusBar">
+  <span><span class="dot"></span>Connecting...</span>
+</div>
+<main>
+  <div class="request-list" id="requestList">
+    <div class="empty-list">Waiting for requests...</div>
+  </div>
+  <div class="detail-pane" id="detailPane">
+    <div class="detail-empty">Select a request to inspect</div>
+  </div>
+</main>
+<script>
+const API = '';
+let requests = [];
+let selected = null;
+let activeTab = 'headers';
+
+async function loadRequests() {
+  try {
+    const r = await fetch(API + '/api/requests');
+    requests = await r.json();
+    renderList();
+  } catch(e) { console.error('Failed to load requests', e); }
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch(API + '/api/status');
+    const s = await r.json();
+    document.getElementById('statusBar').innerHTML =
+      `<span><span class="dot"></span>${s.domain || 'rgrok'}</span>` +
+      `<span>Tunnels: ${s.active_tunnels || 0}</span>` +
+      `<span>TCP: ${s.tcp_tunnels || 0}</span>`;
+  } catch(e) {}
+}
+
+function connectSSE() {
+  const es = new EventSource(API + '/api/stream');
+  es.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.event === 'new_request') {
+        requests.unshift(ev.request);
+        renderList();
+      } else if (ev.event === 'request_completed') {
+        const req = requests.find(r => r.id === ev.id);
+        if (req) {
+          req.duration_ms = ev.duration_ms;
+          req.resp_status = ev.resp_status;
+          renderList();
+          if (selected === req.id) renderDetail(req);
+        }
+      }
+    } catch(err) {}
+  };
+  es.onerror = () => setTimeout(connectSSE, 3000);
+}
+
+function renderList() {
+  const filter = (document.getElementById('filter').value || '').toLowerCase();
+  const filtered = requests.filter(r => {
+    if (!filter) return true;
+    return (r.req_method + ' ' + r.req_url + ' ' + (r.resp_status || '')).toLowerCase().includes(filter);
+  });
+  const el = document.getElementById('requestList');
+  if (!filtered.length) { el.innerHTML = '<div class="empty-list">No requests captured</div>'; return; }
+  el.innerHTML = filtered.map(r => {
+    const sc = statusClass(r.resp_status);
+    const dur = r.duration_ms != null ? r.duration_ms + 'ms' : '...';
+    return `<div class="request-item${selected===r.id?' active':''}" onclick="selectReq('${r.id}')">
+      <span class="method method-${r.req_method}">${r.req_method}</span>
+      <span class="req-path">${r.req_url}</span>
+      <span class="req-status ${sc}">${r.resp_status||''}</span>
+      <span class="req-duration">${dur}</span>
+    </div>`;
+  }).join('');
+}
+
+function statusClass(s) {
+  if (!s) return '';
+  if (s < 300) return 's2xx';
+  if (s < 400) return 's3xx';
+  if (s < 500) return 's4xx';
+  return 's5xx';
+}
+
+function selectReq(id) {
+  selected = id;
+  const req = requests.find(r => r.id === id);
+  if (req) renderDetail(req);
+  renderList();
+}
+
+function renderDetail(r) {
+  const pane = document.getElementById('detailPane');
+  pane.innerHTML = `
+    <div class="detail-header">
+      <span><strong>${r.req_method}</strong> ${r.req_url}</span>
+      <button class="btn" onclick="replay('${r.id}')">Replay</button>
+    </div>
+    <div class="tabs">
+      <div class="tab${activeTab==='headers'?' active':''}" onclick="setTab('headers')">Headers</div>
+      <div class="tab${activeTab==='reqbody'?' active':''}" onclick="setTab('reqbody')">Request Body</div>
+      <div class="tab${activeTab==='response'?' active':''}" onclick="setTab('response')">Response</div>
+      <div class="tab${activeTab==='timing'?' active':''}" onclick="setTab('timing')">Timing</div>
+    </div>
+    <div class="tab-content">${tabContent(r)}</div>`;
+}
+
+function setTab(t) { activeTab = t; const r = requests.find(x => x.id === selected); if(r) renderDetail(r); }
+
+function tabContent(r) {
+  if (activeTab === 'headers') {
+    let h = '<h4 style="margin-bottom:8px">Request Headers</h4><table class="headers">';
+    (r.req_headers||[]).forEach(([k,v]) => h += `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`);
+    h += '</table>';
+    if (r.resp_headers) {
+      h += '<h4 style="margin:16px 0 8px">Response Headers</h4><table class="headers">';
+      r.resp_headers.forEach(([k,v]) => h += `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`);
+      h += '</table>';
+    }
+    return h;
+  }
+  if (activeTab === 'reqbody') {
+    if (!r.req_body) return '<div style="color:var(--muted)">No request body</div>';
+    try { return '<pre class="body">' + esc(atob(r.req_body)) + '</pre>'; }
+    catch { return '<pre class="body">' + esc(r.req_body) + '</pre>'; }
+  }
+  if (activeTab === 'response') {
+    let h = r.resp_status ? `<p>Status: <strong>${r.resp_status}</strong></p>` : '<p style="color:var(--muted)">Awaiting response...</p>';
+    if (r.resp_body) {
+      try { h += '<pre class="body">' + esc(atob(r.resp_body)) + '</pre>'; }
+      catch { h += '<pre class="body">' + esc(r.resp_body) + '</pre>'; }
+      if (r.resp_body_truncated) h += '<p style="color:var(--yellow);margin-top:8px">Body truncated (>1MB)</p>';
+    }
+    return h;
+  }
+  if (activeTab === 'timing') {
+    return `<table class="headers">
+      <tr><td>Captured at</td><td>${r.captured_at || 'N/A'}</td></tr>
+      <tr><td>Duration</td><td>${r.duration_ms != null ? r.duration_ms + 'ms' : 'Pending'}</td></tr>
+      <tr><td>Remote addr</td><td>${r.remote_addr || 'N/A'}</td></tr>
+      <tr><td>TLS version</td><td>${r.tls_version || 'None'}</td></tr>
+      <tr><td>Tunnel ID</td><td>${r.tunnel_id || 'N/A'}</td></tr>
+    </table>`;
+  }
+  return '';
+}
+
+async function replay(id) {
+  try {
+    const r = await fetch(API + '/api/requests/' + id + '/replay', { method: 'POST' });
+    if (r.ok) { const d = await r.json(); setTimeout(loadRequests, 500); }
+  } catch(e) { console.error('Replay failed', e); }
+}
+
+async function clearAll() {
+  await fetch(API + '/api/requests', { method: 'DELETE' });
+  requests = []; selected = null; renderList();
+  document.getElementById('detailPane').innerHTML = '<div class="detail-empty">Select a request to inspect</div>';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+document.getElementById('filter').addEventListener('input', renderList);
+loadRequests();
+loadStatus();
+connectSSE();
+setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>

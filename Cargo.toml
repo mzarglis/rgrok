@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/rgrok-proto",
+    "crates/rgrok-server",
+    "crates/rgrok-client",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio          = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+axum           = { version = "0.8", features = ["macros"] }
+tower          = { version = "0.5" }
+tower-http     = { version = "0.6", features = ["trace", "cors"] }
+rustls         = { version = "0.23" }
+rustls-pemfile = "2"
+rcgen          = "0.14"
+instant-acme   = { version = "0.8", features = ["hyper-rustls"] }
+yamux          = "0.13"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+rmp-serde      = "1"
+jsonwebtoken   = { version = "10", features = ["rust_crypto"] }
+clap           = { version = "4", features = ["derive", "env"] }
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid           = { version = "1", features = ["v4"] }
+rand           = "0.9"
+thiserror      = "2"
+anyhow         = "1"
+reqwest        = { version = "0.12", features = ["rustls-tls", "json"] }
+tokio-rustls   = "0.26"
+futures        = "0.3"
+bytes          = "1"
+http           = "1"
+hyper          = { version = "1", features = ["http1", "server", "client"] }
+hyper-util     = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+dashmap        = "6"
+chrono         = { version = "0.4", features = ["serde"] }
+async-trait    = "0.1"
+bcrypt         = "0.16"
+base64         = "0.22"
+crossterm      = "0.29"
+pin-project-lite = "0.2"
+tokio-stream     = { version = "0.1", features = ["sync"] }
+tokio-util       = { version = "0.7", features = ["compat"] }
+prometheus       = "0.14"
+x509-parser      = "0.16"

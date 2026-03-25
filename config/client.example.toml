@@ -1,0 +1,26 @@
+# rgrok client configuration
+# Default location: ~/.config/rgrok/config.toml
+# Set via: rgrok authtoken <your-token>
+
+[server]
+# Address of your rgrok server
+host = "tunnel.mysite.com"
+port = 7835
+
+[auth]
+# Your auth token (set via `rgrok authtoken <token>`)
+token = ""
+
+[defaults]
+# Default inspection UI port
+inspect_port = 4040
+
+# Enable request inspection by default
+inspect = true
+
+# Max body capture size in bytes (default 1 MB)
+max_body_bytes = 1048576
+
+[logging]
+level = "info"
+format = "pretty"

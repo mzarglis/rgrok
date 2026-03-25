@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Project-specific configuration
+# We ignore actual TOML configs but keep the examples
+config/*.toml
+!config/*.example.toml
+
+# Environment and Secrets
+.env
+*.pem
+*.key
+*.crt
+
+# Tooling
+.cargo/config.toml
