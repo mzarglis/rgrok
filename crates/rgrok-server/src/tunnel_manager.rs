@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+/use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -146,6 +146,7 @@ pub struct TunnelSession {
     pub basic_auth: Option<BasicAuthConfig>,
     pub basic_auth_hash: Option<String>,
     pub options: TunnelOptions,
+    #[allow(dead_code)]
     pub created_at: Instant,
     /// Sink to send messages to the connected client
     pub control_tx: mpsc::Sender<ServerMsg>,
