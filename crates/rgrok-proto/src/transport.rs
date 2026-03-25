@@ -130,7 +130,7 @@ where
                 }
                 Poll::Ready(Ok(len))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => Poll::Ready(Ok(0)),
             Poll::Pending => Poll::Pending,
         }
@@ -154,10 +154,10 @@ where
                 let msg = tokio_tungstenite::tungstenite::Message::Binary(buf.to_vec().into());
                 match self.inner.start_send_unpin(msg) {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                    Err(e) => Poll::Ready(Err(io::Error::other(e))),
                 }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -165,13 +165,13 @@ where
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner
             .poll_flush_unpin(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner
             .poll_close_unpin(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 }
 
@@ -221,10 +221,7 @@ where
         loop {
             // Check for new open requests (non-blocking)
             if pending_reply.is_none() {
-                match open_rx.try_recv() {
-                    Ok(reply) => pending_reply = Some(reply),
-                    Err(_) => {}
-                }
+                if let Ok(reply) = open_rx.try_recv() { pending_reply = Some(reply) }
             }
 
             // Drive the connection: poll both inbound and outbound in a single poll_fn

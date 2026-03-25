@@ -40,7 +40,7 @@ pub struct CapturedRequest {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum InspectEvent {
     NewRequest {
-        request: CapturedRequest,
+        request: Box<CapturedRequest>,
     },
     RequestCompleted {
         id: String,

@@ -21,8 +21,8 @@ where
     U: AsyncRead + AsyncWrite + Unpin,
     L: AsyncRead + AsyncWrite + Unpin,
 {
-    if inspect.is_some() {
-        bridge_with_capture(upstream, local, inspect.unwrap(), stats).await
+    if let Some(inspect) = inspect {
+        bridge_with_capture(upstream, local, inspect, stats).await
     } else {
         let (up, down) = tokio::io::copy_bidirectional(upstream, local).await?;
         stats.record_bytes_in(up);

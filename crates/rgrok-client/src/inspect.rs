@@ -42,7 +42,7 @@ impl InspectState {
             queue.pop_front();
         }
         let _ = self.inspect_tx.send(InspectEvent::NewRequest {
-            request: capture.clone(),
+            request: Box::new(capture.clone()),
         });
         queue.push_back(capture);
     }

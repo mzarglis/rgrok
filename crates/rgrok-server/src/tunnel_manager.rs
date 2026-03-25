@@ -104,12 +104,7 @@ impl ServerState {
     /// Allocate a TCP port from the configured range
     pub fn allocate_tcp_port(&self) -> Option<u16> {
         let [start, end] = self.config.server.tcp_port_range;
-        for port in start..end {
-            if !self.tcp_tunnels.contains_key(&port) {
-                return Some(port);
-            }
-        }
-        None
+        (start..end).find(|&port| !self.tcp_tunnels.contains_key(&port))
     }
 
     /// Register a TCP tunnel on a specific port
@@ -130,7 +125,7 @@ impl ServerState {
                 queue.pop_front();
             }
             let _ = self.inspect_tx.send(InspectEvent::NewRequest {
-                request: capture.clone(),
+                request: Box::new(capture.clone()),
             });
             queue.push_back(capture);
         }
