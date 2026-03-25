@@ -163,15 +163,11 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner
-            .poll_flush_unpin(cx)
-            .map_err(io::Error::other)
+        self.inner.poll_flush_unpin(cx).map_err(io::Error::other)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner
-            .poll_close_unpin(cx)
-            .map_err(io::Error::other)
+        self.inner.poll_close_unpin(cx).map_err(io::Error::other)
     }
 }
 
@@ -221,7 +217,9 @@ where
         loop {
             // Check for new open requests (non-blocking)
             if pending_reply.is_none() {
-                if let Ok(reply) = open_rx.try_recv() { pending_reply = Some(reply) }
+                if let Ok(reply) = open_rx.try_recv() {
+                    pending_reply = Some(reply)
+                }
             }
 
             // Drive the connection: poll both inbound and outbound in a single poll_fn

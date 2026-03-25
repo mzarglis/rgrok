@@ -196,7 +196,7 @@ async fn proxy_http_request(
 
     let start = std::time::Instant::now();
     let inspect = tunnel.options.inspect;
-     // captured after parts destructure
+    // captured after parts destructure
 
     // Serialize the HTTP request into raw HTTP/1.1 and write into the yamux stream.
     // The client will forward this to the local service as-is.
@@ -287,13 +287,12 @@ async fn proxy_http_request(
             ));
         }
     };
-    if !body_bytes.is_empty()
-        && proxy_stream.write_all(&body_bytes).await.is_err() {
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "Failed to write body to tunnel",
-            ));
-        }
+    if !body_bytes.is_empty() && proxy_stream.write_all(&body_bytes).await.is_err() {
+        return Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            "Failed to write body to tunnel",
+        ));
+    }
 
     // Read the HTTP response back from the proxy stream.
     // We read in chunks and parse the response status + headers, then the body.
