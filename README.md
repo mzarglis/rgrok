@@ -3,8 +3,10 @@
 A self-hosted [ngrok](https://ngrok.com) alternative written in Rust. Expose any local port to the internet through your own VPS — no third-party tunnel service, no data leaving your infrastructure.
 
 [![CI](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml/badge.svg)](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mzarglis/rgrok)](https://github.com/mzarglis/rgrok/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/mzarglis/rgrok/total)](https://github.com/mzarglis/rgrok/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 ```
   Browser                      Your VPS (rgrok-server)         Your Machine
@@ -113,7 +115,7 @@ For the full protocol specification see [docs/rgrok-spec.md](docs/rgrok-spec.md)
 
 ## Building from Source
 
-**Prerequisites:** Rust 1.75+ ([rustup.rs](https://rustup.rs))
+**Prerequisites:** Rust 1.88+ ([rustup.rs](https://rustup.rs))
 
 ```bash
 git clone https://github.com/mzarglis/rgrok
