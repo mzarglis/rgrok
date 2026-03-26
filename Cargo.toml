@@ -52,3 +52,9 @@ tokio-stream     = { version = "0.1", features = ["sync"] }
 tokio-util       = { version = "0.7", features = ["compat"] }
 prometheus       = "0.14"
 x509-parser      = "0.16"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
