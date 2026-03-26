@@ -19,18 +19,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary_suffix: ""
+            artifact_name: x86_64-linux-gnu
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary_suffix: ""
+            artifact_name: aarch64-linux-gnu
           - target: x86_64-apple-darwin
             os: macos-latest
             binary_suffix: ""
+            artifact_name: x86_64-apple-darwin
           - target: aarch64-apple-darwin
             os: macos-latest
             binary_suffix: ""
+            artifact_name: aarch64-apple-darwin
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary_suffix: ".exe"
+            artifact_name: x86_64-windows-msvc
 
     steps:
       - uses: actions/checkout@v6
@@ -68,12 +73,12 @@ jobs:
           cp target/${{ matrix.target }}/release/rgrok${{ matrix.binary_suffix }} staging/
           cp target/${{ matrix.target }}/release/rgrok-server${{ matrix.binary_suffix }} staging/
           cd staging
-          tar czf ../rgrok-${{ matrix.target }}.tar.gz *
+          tar czf ../rgrok-${{ matrix.artifact_name }}.tar.gz *
 
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.target }}
-          path: rgrok-${{ matrix.target }}.tar.gz
+          name: binaries-${{ matrix.artifact_name }}
+          path: rgrok-${{ matrix.artifact_name }}.tar.gz
 
   release:
     name: Create Release
