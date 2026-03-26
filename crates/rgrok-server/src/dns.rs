@@ -142,10 +142,17 @@ impl CloudflareClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::{Path, Query};
+    use axum::extract::{Path, Query, State};
     use axum::routing::{delete as axum_delete, post as axum_post};
     use axum::{Json, Router};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct MockState {
+        delete_count: Arc<AtomicU32>,
+    }
 
     async fn mock_create_dns_record() -> Json<serde_json::Value> {
         Json(serde_json::json!({
@@ -154,8 +161,10 @@ mod tests {
     }
 
     async fn mock_delete_dns_record(
+        State(state): State<MockState>,
         Path((_zone_id, _record_id)): Path<(String, String)>,
     ) -> axum::http::StatusCode {
+        state.delete_count.fetch_add(1, Ordering::SeqCst);
         axum::http::StatusCode::OK
     }
 
@@ -174,7 +183,7 @@ mod tests {
         }
     }
 
-    fn mock_router() -> Router {
+    fn mock_router(state: MockState) -> Router {
         Router::new()
             .route(
                 "/zones/{zone_id}/dns_records",
@@ -184,21 +193,28 @@ mod tests {
                 "/zones/{zone_id}/dns_records/{record_id}",
                 axum_delete(mock_delete_dns_record),
             )
+            .with_state(state)
     }
 
-    async fn start_mock_server() -> u16 {
+    async fn start_mock_server() -> (u16, Arc<AtomicU32>) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let delete_count = Arc::new(AtomicU32::new(0));
+        let state = MockState {
+            delete_count: delete_count.clone(),
+        };
         tokio::spawn(async move {
-            axum::serve(listener, mock_router()).await.unwrap();
+            let _ = ready_tx.send(());
+            axum::serve(listener, mock_router(state)).await.unwrap();
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        port
+        ready_rx.await.expect("mock server failed to start");
+        (port, delete_count)
     }
 
     #[tokio::test]
     async fn test_create_a_record_returns_id() {
-        let port = start_mock_server().await;
+        let (port, _) = start_mock_server().await;
         let client = CloudflareClient::with_base_url(
             "test-token".to_string(),
             "zone-123".to_string(),
@@ -214,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_record_succeeds() {
-        let port = start_mock_server().await;
+        let (port, _) = start_mock_server().await;
         let client = CloudflareClient::with_base_url(
             "test-token".to_string(),
             "zone-123".to_string(),
@@ -227,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_txt_record_returns_id() {
-        let port = start_mock_server().await;
+        let (port, _) = start_mock_server().await;
         let client = CloudflareClient::with_base_url(
             "test-token".to_string(),
             "zone-123".to_string(),
@@ -243,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_txt_records_cleans_up_all() {
-        let port = start_mock_server().await;
+        let (port, delete_count) = start_mock_server().await;
         let client = CloudflareClient::with_base_url(
             "test-token".to_string(),
             "zone-123".to_string(),
@@ -253,5 +269,10 @@ mod tests {
         // delete_txt_records lists TXT records then deletes each one
         let result = client.delete_txt_records("_acme-challenge.test").await;
         assert!(result.is_ok());
+        assert_eq!(
+            delete_count.load(Ordering::SeqCst),
+            2,
+            "should have deleted 2 TXT records"
+        );
     }
 }

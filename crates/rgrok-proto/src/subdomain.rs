@@ -74,11 +74,23 @@ mod tests {
     #[test]
     fn test_generate_subdomain_format() {
         let sub = generate_subdomain();
-        let parts: Vec<&str> = sub.split('-').collect();
-        assert_eq!(parts.len(), 3);
-        assert!(ADJECTIVES.contains(&parts[0]));
-        assert!(NOUNS.contains(&parts[1]));
-        assert_eq!(parts[2].len(), 4);
+        let hyphen_count = sub.chars().filter(|&c| c == '-').count();
+        assert_eq!(hyphen_count, 2, "subdomain should have exactly 2 hyphens");
+
+        let dash_pos: Vec<_> = sub.match_indices('-').collect();
+        assert_eq!(dash_pos.len(), 2);
+
+        let adj = &sub[..dash_pos[0].0];
+        let noun = &sub[dash_pos[0].0 + 1..dash_pos[1].0];
+        let suffix = &sub[dash_pos[1].0 + 1..];
+
+        assert!(ADJECTIVES.contains(&adj), "adjective '{}' not in list", adj);
+        assert!(NOUNS.contains(&noun), "noun '{}' not in list", noun);
+        assert_eq!(suffix.len(), 4);
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix should be hex"
+        );
     }
 
     #[test]
