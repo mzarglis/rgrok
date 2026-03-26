@@ -436,18 +436,13 @@ mod tests {
 
         tokio::spawn(async move {
             let ready_at = tokio::time::Instant::now() + Duration::from_millis(1500);
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        if tokio::time::Instant::now() < ready_at {
-                            drop(stream); // RST triggers client retry
-                        } else {
-                            let _ = tokio_tungstenite::accept_async(stream).await;
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((stream, _)) = listener.accept().await {
+                if tokio::time::Instant::now() < ready_at {
+                    drop(stream); // RST triggers client retry
+                } else {
+                    let _ = tokio_tungstenite::accept_async(stream).await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    break;
                 }
             }
         });
