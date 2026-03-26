@@ -57,4 +57,4 @@ x509-parser      = "0.16"
 strip = true
 lto = true
 codegen-units = 1
-opt-level = "z"
+opt-level = 3
