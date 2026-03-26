@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -22,15 +23,15 @@ jobs:
         uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch
+          default_bump: false
           release_branches: main
           tag_prefix: v
-          custom_release_rules: |
-            feat:minor:Features,fix:patch:Bug Fixes,perf:patch:Performance,refactor:patch:Refactoring,docs:patch:Documentation,chore:false:Chores,ci:false:CI,test:false:Tests,build:false:Build
+          custom_release_rules: feat:minor:Features,fix:patch:Bug Fixes,perf:patch:Performance,refactor:patch:Refactoring
 
-      - name: Log new tag
+      - name: Trigger release workflow
         if: steps.tag_version.outputs.new_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Created tag ${{ steps.tag_version.outputs.new_tag }}"
-          echo "Previous tag: ${{ steps.tag_version.outputs.previous_tag }}"
-          echo "Release type: ${{ steps.tag_version.outputs.release_type }}"
+          gh workflow run release.yml --ref ${{ steps.tag_version.outputs.new_tag }}
