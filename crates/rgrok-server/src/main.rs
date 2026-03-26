@@ -380,12 +380,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Server sends AuthErr then closes — we may get the message or EOF
-        match read_msg_from_stream::<ServerMsg>(&mut ctrl).await {
-            Ok(ServerMsg::AuthErr { .. }) => {} // Got the rejection message
-            Err(_) => {}                        // Connection closed before we read — also valid
-            Ok(other) => panic!("Expected AuthErr or EOF, got {:?}", other),
-        }
+        // Server sends AuthErr then closes
+        let msg = read_msg_from_stream::<ServerMsg>(&mut ctrl)
+            .await
+            .expect("Expected AuthErr, got EOF");
+        assert!(
+            matches!(msg, ServerMsg::AuthErr { .. }),
+            "Expected AuthErr, got {:?}",
+            msg
+        );
     }
 
     #[tokio::test]
@@ -687,6 +690,9 @@ mod tests {
         assert!(state.tunnels.contains_key("shutdown"));
         assert_eq!(state.metrics.ws_connections_active.get(), 1);
 
+        // Prepare cleanup notification
+        let cleanup_future = state.cleanup_notify.notified();
+
         // Trigger graceful shutdown
         state.cancel.cancel();
 
@@ -701,8 +707,8 @@ mod tests {
             "Server should close the connection within 5 seconds"
         );
 
-        // Allow async cleanup to complete
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for async cleanup to complete
+        let _ = tokio::time::timeout(Duration::from_secs(2), cleanup_future).await;
 
         // Verify tunnel cleanup
         assert!(
@@ -839,16 +845,18 @@ mod tests {
         .await
         .unwrap();
 
-        match read_msg_from_stream::<ServerMsg>(&mut ctrl).await {
-            Ok(ServerMsg::AuthErr { reason }) => {
+        match read_msg_from_stream::<ServerMsg>(&mut ctrl)
+            .await
+            .expect("Expected AuthErr, got EOF")
+        {
+            ServerMsg::AuthErr { reason } => {
                 assert!(
                     reason.contains("revoked"),
                     "Expected revocation message, got: {}",
                     reason
                 );
             }
-            Err(_) => {} // Connection closed — also valid
-            Ok(other) => panic!("Expected AuthErr for revoked token, got {:?}", other),
+            other => panic!("Expected AuthErr for revoked token, got {:?}", other),
         }
     }
 }

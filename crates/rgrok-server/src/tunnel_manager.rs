@@ -33,6 +33,8 @@ pub struct ServerState {
     pub tls_config: tokio::sync::watch::Sender<Option<Arc<rustls::ServerConfig>>>,
     #[allow(dead_code)]
     pub tls_config_rx: tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
+    /// Notify when a tunnel is unregistered (useful for tests)
+    pub cleanup_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ServerState {
@@ -51,6 +53,7 @@ impl ServerState {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             tls_config: tls_tx,
             tls_config_rx: tls_rx,
+            cleanup_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -99,6 +102,7 @@ impl ServerState {
         self.tunnels.remove(subdomain);
         self.captures.remove(subdomain);
         self.metrics.active_tunnels.dec();
+        self.cleanup_notify.notify_waiters();
     }
 
     /// Allocate a TCP port from the configured range
@@ -115,6 +119,7 @@ impl ServerState {
     /// Unregister a TCP tunnel
     pub fn unregister_tcp_tunnel(&self, port: u16) {
         self.tcp_tunnels.remove(&port);
+        self.cleanup_notify.notify_waiters();
     }
 
     /// Store a captured request for inspection

@@ -132,10 +132,6 @@ cargo build --release
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-## Security
-
-Please do not open public issues for security vulnerabilities. See [SECURITY.md](SECURITY.md) for the responsible disclosure process.
-
 ## License
 
 AGPL-3.0 — see [LICENSE](LICENSE).

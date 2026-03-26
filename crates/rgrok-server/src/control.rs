@@ -114,7 +114,6 @@ where
                 },
             )
             .await;
-            driver_handle.abort();
             return;
         }
     };
@@ -131,7 +130,6 @@ where
                 },
             )
             .await;
-            driver_handle.abort();
             return;
         }
     };
@@ -146,7 +144,6 @@ where
             },
         )
         .await;
-        driver_handle.abort();
         return;
     }
 
