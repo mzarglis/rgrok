@@ -20,7 +20,7 @@ Thanks for taking the time to contribute. This document covers how to get a deve
 
 **Clone and build:**
 ```bash
-git clone https://github.com/your-org/rgrok
+git clone https://github.com/mzarglis/rgrok
 cd rgrok
 cargo build
 ```
@@ -129,4 +129,4 @@ Use the [Feature Request](.github/ISSUE_TEMPLATE/feature_request.yml) template. 
 
 ## Questions
 
-Open a [Discussion](https://github.com/your-org/rgrok/discussions) for usage questions rather than an issue. Issues are for actionable bug reports and feature requests.
+Open a [Discussion](https://github.com/mzarglis/rgrok/discussions) for usage questions rather than an issue. Issues are for actionable bug reports and feature requests.
