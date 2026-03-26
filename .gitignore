@@ -8,6 +8,7 @@
 *.swp
 *.swo
 .claude/
+todo.md
 
 # OS specific
 .DS_Store

@@ -18,9 +18,9 @@ use crate::tunnel_manager::{ServerState, TunnelSession};
 pub async fn serve(
     state: Arc<ServerState>,
     tls_acceptor: Option<TlsAcceptor>,
+    listener: TcpListener,
 ) -> anyhow::Result<()> {
-    let bind_addr = format!("0.0.0.0:{}", state.config.server.control_port);
-    let listener = TcpListener::bind(&bind_addr).await?;
+    let bind_addr = listener.local_addr()?;
     info!("Control plane listening on {}", bind_addr);
 
     loop {
