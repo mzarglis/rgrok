@@ -200,7 +200,6 @@ async fn tunnel_status(State(state): State<Arc<InspectState>>) -> Json<serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// Replay Mechanism: replaying a captured request correctly re-issues it to the local
     /// port and stores the result as a new capture.
@@ -242,10 +241,12 @@ mod tests {
             .with_state(state.clone());
         let inspect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let inspect_port = inspect_listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let _ = ready_tx.send(());
             axum::serve(inspect_listener, inspect_app).await.unwrap();
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        ready_rx.await.expect("inspect server failed to start");
 
         // Call the replay endpoint
         let client = reqwest::Client::new();
@@ -284,10 +285,12 @@ mod tests {
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let _ = ready_tx.send(());
             axum::serve(listener, app).await.unwrap();
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        ready_rx.await.expect("server failed to start");
 
         let client = reqwest::Client::new();
         let resp = client

@@ -142,7 +142,11 @@ mod tests {
         let decoded: ClientMsg = decode_msg(&encoded).unwrap();
         match decoded {
             ClientMsg::TunnelRequest {
-                id, tunnel_type, ..
+                id,
+                tunnel_type,
+                subdomain,
+                basic_auth,
+                options,
             } => {
                 assert_eq!(id, "req-1");
                 assert_eq!(
@@ -151,6 +155,20 @@ mod tests {
                         remote_port: Some(15432)
                     }
                 );
+                assert_eq!(subdomain, Some("myapp".to_string()));
+                assert_eq!(
+                    basic_auth.as_ref().map(|b| &b.username),
+                    Some(&"admin".to_string())
+                );
+                assert_eq!(
+                    basic_auth.as_ref().map(|b| &b.password),
+                    Some(&"secret".to_string())
+                );
+                assert_eq!(options.host_header, Some("localhost".to_string()));
+                assert!(options.inspect);
+                assert_eq!(options.response_header.len(), 1);
+                assert_eq!(options.response_header[0].0, "X-Custom");
+                assert_eq!(options.response_header[0].1, "value");
             }
             _ => panic!("wrong variant"),
         }
