@@ -98,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
     // Set initial TLS config on the watch channel
     let _ = state.tls_config.send(Some(tls_config.clone()));
 
+    // Bind the control plane port before spawning so the port is held continuously.
+    let control_listener =
+        tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.server.control_port)).await?;
+
     // Spawn control plane listener (with TLS if certs are available)
     let control_state = state.clone();
     let control_tls = if config.tls.cert_file.is_some() || config.tls.key_file.is_some() {
@@ -113,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     tokio::spawn(async move {
-        if let Err(e) = control::serve(control_state, control_tls).await {
+        if let Err(e) = control::serve(control_state, control_tls, control_listener).await {
             tracing::error!("Control plane error: {}", e);
         }
     });
@@ -303,7 +307,9 @@ mod tests {
     }
 
     async fn start_test_server() -> (u16, Arc<tunnel_manager::ServerState>) {
-        let port = find_free_port().await;
+        // Keep the listener bound to avoid port reuse races between bind and serve.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let http_port = find_free_port().await;
         let https_port = find_free_port().await;
         let cfg = test_config(port, http_port, https_port);
@@ -311,7 +317,7 @@ mod tests {
 
         let s = state.clone();
         tokio::spawn(async move {
-            control::serve(s, None).await.ok();
+            control::serve(s, None, listener).await.ok();
         });
 
         // Wait for server to start
@@ -802,7 +808,8 @@ mod tests {
         let claims = auth::validate_token(&token, TEST_SECRET).unwrap();
         let revoked_jti = claims.jti;
 
-        let port = find_free_port().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let http_port = find_free_port().await;
         let https_port = find_free_port().await;
         let mut cfg = test_config(port, http_port, https_port);
@@ -811,7 +818,7 @@ mod tests {
 
         let s = state.clone();
         tokio::spawn(async move {
-            control::serve(s, None).await.ok();
+            control::serve(s, None, listener).await.ok();
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 

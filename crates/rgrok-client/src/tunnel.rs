@@ -428,20 +428,21 @@ mod tests {
     /// sleep 2s, server starts at t=1.5s, attempt 3 succeeds (t=3s).
     #[tokio::test]
     async fn test_connect_with_retry_succeeds_after_initial_failures() {
-        let tmp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = tmp.local_addr().unwrap().port();
-        drop(tmp);
+        // Keep the listener bound to avoid port reuse races. Connections accepted
+        // before 1.5 s are immediately dropped (TCP RST), which `connect_with_retry`
+        // treats as a retryable error just like connection-refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
 
-        let port_clone = port;
         tokio::spawn(async move {
-            // Start accepting after 1.5s so first two attempts fail
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if let Ok(listener) =
-                tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_clone)).await
-            {
-                if let Ok((stream, _)) = listener.accept().await {
+            let ready_at = tokio::time::Instant::now() + Duration::from_millis(1500);
+            while let Ok((stream, _)) = listener.accept().await {
+                if tokio::time::Instant::now() < ready_at {
+                    drop(stream); // RST triggers client retry
+                } else {
                     let _ = tokio_tungstenite::accept_async(stream).await;
                     tokio::time::sleep(Duration::from_secs(60)).await;
+                    break;
                 }
             }
         });
