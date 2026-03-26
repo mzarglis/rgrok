@@ -2,8 +2,8 @@
 
 A self-hosted [ngrok](https://ngrok.com) alternative written in Rust. Expose any local port to the internet through your own VPS — no third-party tunnel service, no data leaving your infrastructure.
 
-[![CI](https://github.com/your-org/rgrok/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/rgrok/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml/badge.svg)](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
 ```
@@ -33,13 +33,13 @@ A self-hosted [ngrok](https://ngrok.com) alternative written in Rust. Expose any
 **Pre-built binary** (Linux, macOS, Windows):
 ```bash
 # Download from the latest release
-curl -L https://github.com/your-org/rgrok/releases/latest/download/rgrok-x86_64-unknown-linux-gnu -o rgrok
+curl -L https://github.com/mzarglis/rgrok/releases/latest/download/rgrok-x86_64-unknown-linux-gnu -o rgrok
 chmod +x rgrok && sudo mv rgrok /usr/local/bin/
 ```
 
 **Build from source:**
 ```bash
-cargo install --git https://github.com/your-org/rgrok rgrok-client
+cargo install --git https://github.com/mzarglis/rgrok rgrok-client
 ```
 
 ### 2. Authenticate
@@ -116,7 +116,7 @@ For the full protocol specification see [docs/rgrok-spec.md](docs/rgrok-spec.md)
 **Prerequisites:** Rust 1.75+ ([rustup.rs](https://rustup.rs))
 
 ```bash
-git clone https://github.com/your-org/rgrok
+git clone https://github.com/mzarglis/rgrok
 cd rgrok
 
 cargo build --release
