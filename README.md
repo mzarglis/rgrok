@@ -5,7 +5,7 @@ A self-hosted [ngrok](https://ngrok.com) alternative written in Rust. Expose any
 [![CI](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml/badge.svg)](https://github.com/mzarglis/rgrok/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mzarglis/rgrok)](https://github.com/mzarglis/rgrok/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/mzarglis/rgrok/total)](https://github.com/mzarglis/rgrok/releases)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 ```
@@ -70,9 +70,10 @@ rgrok https 3000                       # HTTPS (server terminates TLS, local get
 rgrok tcp 22                           # Raw TCP tunnel (e.g. SSH)
 
 rgrok http 3000 --subdomain myapp      # Request a specific subdomain
-rgrok http 3000 --auth user:pass       # Protect with basic auth
+rgrok http 3000 --auth user:pass       # Protect with basic auth (password may contain ':')
 rgrok http 3000 --no-inspect           # Disable request capture
-rgrok http 3000 --server host:7835     # Connect to a specific server
+rgrok http 3000 --server host:7835     # Connect to a specific (TLS) server
+rgrok --server ws://127.0.0.1:7835 --insecure http 3000  # Local dev only
 
 rgrok authtoken <token>                # Save auth token to config
 rgrok config                           # Print current config
@@ -134,4 +135,4 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE).

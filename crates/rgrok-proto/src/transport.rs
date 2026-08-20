@@ -80,6 +80,7 @@ impl TunnelTransport for YamuxTransport {
 pub struct WsCompat<S> {
     inner: S,
     read_buf: BytesMut,
+    closed: bool,
 }
 
 impl<S> WsCompat<S> {
@@ -87,6 +88,7 @@ impl<S> WsCompat<S> {
         Self {
             inner,
             read_buf: BytesMut::new(),
+            closed: false,
         }
     }
 }
@@ -105,34 +107,52 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        if self.closed {
+            return Poll::Ready(Ok(0));
+        }
+
         if !self.read_buf.is_empty() {
             let len = std::cmp::min(buf.len(), self.read_buf.len());
             buf[..len].copy_from_slice(&self.read_buf.split_to(len));
             return Poll::Ready(Ok(len));
         }
 
-        match self.inner.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(msg))) => {
-                let data = match msg {
-                    tokio_tungstenite::tungstenite::Message::Binary(data) => data,
-                    tokio_tungstenite::tungstenite::Message::Close(_) => {
-                        return Poll::Ready(Ok(0));
+        loop {
+            match self.inner.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(msg))) => {
+                    let data = match msg {
+                        tokio_tungstenite::tungstenite::Message::Binary(data) => data,
+                        tokio_tungstenite::tungstenite::Message::Close(_) => {
+                            self.closed = true;
+                            return Poll::Ready(Ok(0));
+                        }
+                        // Tungstenite handles Ping/Pong at the WebSocket layer. They do not
+                        // carry yamux bytes, so consume them and keep waiting for payload.
+                        // Text and raw frames are likewise not valid payloads for this adapter.
+                        tokio_tungstenite::tungstenite::Message::Ping(_)
+                        | tokio_tungstenite::tungstenite::Message::Pong(_)
+                        | tokio_tungstenite::tungstenite::Message::Frame(_)
+                        | tokio_tungstenite::tungstenite::Message::Text(_) => continue,
+                    };
+                    if data.is_empty() {
+                        continue;
                     }
-                    _ => return Poll::Ready(Ok(0)),
-                };
-                if data.is_empty() {
+                    let len = std::cmp::min(buf.len(), data.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    if len < data.len() {
+                        self.read_buf.extend_from_slice(&data[len..]);
+                    }
+                    return Poll::Ready(Ok(len));
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(None) => {
+                    self.closed = true;
                     return Poll::Ready(Ok(0));
                 }
-                let len = std::cmp::min(buf.len(), data.len());
-                buf[..len].copy_from_slice(&data[..len]);
-                if len < data.len() {
-                    self.read_buf.extend_from_slice(&data[len..]);
-                }
-                Poll::Ready(Ok(len))
+                // A pending poll has registered the caller's waker with the underlying
+                // WebSocket stream, so return it rather than spinning over empty input.
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => Poll::Ready(Ok(0)),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -571,6 +591,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wscompat_skips_control_frames_before_binary_data() {
+        let messages = vec![
+            Ok(tokio_tungstenite::tungstenite::Message::Ping(
+                vec![1, 2, 3].into(),
+            )),
+            Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                vec![4, 5, 6].into(),
+            )),
+            Ok(tokio_tungstenite::tungstenite::Message::Frame(
+                tokio_tungstenite::tungstenite::protocol::frame::Frame::ping(vec![7, 8]),
+            )),
+            Ok(tokio_tungstenite::tungstenite::Message::Binary(
+                vec![9, 10, 11].into(),
+            )),
+        ]
+        .into_iter()
+        .collect();
+        let mock = MockWsStream {
+            messages,
+            sent: Vec::new(),
+        };
+        let mut ws = WsCompat::new(mock);
+
+        let mut buf = [0u8; 3];
+        let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], &[9, 10, 11]);
+    }
+
+    #[tokio::test]
     async fn test_wscompat_write_sends_binary() {
         let mock = MockWsStream::new(vec![]);
         let mut ws = WsCompat::new(mock);
@@ -588,15 +639,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_wscompat_close_message_returns_eof() {
-        // A Close message should yield 0 bytes (EOF).
+        // A Close message should yield 0 bytes (EOF), and remain EOF on later reads.
         let close_msg = tokio_tungstenite::tungstenite::Message::Close(None);
         let mock = MockWsStream {
-            messages: vec![Ok(close_msg)].into_iter().collect(),
+            messages: vec![
+                Ok(close_msg),
+                Ok(tokio_tungstenite::tungstenite::Message::Binary(
+                    vec![1, 2, 3].into(),
+                )),
+            ]
+            .into_iter()
+            .collect(),
             sent: Vec::new(),
         };
         let mut ws = WsCompat::new(mock);
 
         let mut buf = [0u8; 32];
+        let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
         let n = futures::AsyncReadExt::read(&mut ws, &mut buf)
             .await
             .unwrap();

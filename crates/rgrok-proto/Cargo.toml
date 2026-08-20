@@ -2,7 +2,9 @@
 name = "rgrok-proto"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+license-file.workspace = true
 description = "Shared protocol types for rgrok tunnel system"
 
 [dependencies]

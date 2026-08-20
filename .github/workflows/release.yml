@@ -72,6 +72,7 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/release/rgrok${{ matrix.binary_suffix }} staging/
           cp target/${{ matrix.target }}/release/rgrok-server${{ matrix.binary_suffix }} staging/
+          cp LICENSE staging/
           cd staging
           tar czf ../rgrok-${{ matrix.artifact_name }}.tar.gz *
 

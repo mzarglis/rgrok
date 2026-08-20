@@ -2,7 +2,9 @@
 name = "rgrok-client"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+license-file.workspace = true
 description = "rgrok tunnel client CLI"
 
 [[bin]]
@@ -40,3 +42,6 @@ toml = "0.8"
 dirs = "6"
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
