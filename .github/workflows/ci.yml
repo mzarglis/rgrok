@@ -24,6 +24,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deploy/Dockerfile'
 
   check:
     name: Check
@@ -43,6 +44,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "No Rust changes, skipping"
+
+  metadata:
+    name: Metadata
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify MSRV and Docker builder stay aligned
+        shell: bash
+        run: |
+          msrv="$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[].rust_version]
+            | unique
+            | if length == 1 and .[0] != null
+              then .[0]
+              else error("all workspace packages must share one rust-version")
+              end
+          ')"
+          grep -Fx "FROM rust:${msrv}-bookworm AS builder" deploy/Dockerfile
 
   test:
     name: Test
