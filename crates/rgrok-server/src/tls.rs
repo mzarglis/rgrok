@@ -110,15 +110,39 @@ pub fn load_tls_config(config: &Config) -> anyhow::Result<Arc<rustls::ServerConf
 /// 5. Download and save cert chain
 /// 6. Clean up TXT records
 pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    use instant_acme::{
-        Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-        OrderStatus,
-    };
-
     let cf = CloudflareClient::new(
         config.cloudflare.api_token.clone(),
         config.cloudflare.zone_id.clone(),
     );
+    let mut txt_record_ids = Vec::new();
+
+    let result = provision_wildcard_cert_inner(config, &cf, &mut txt_record_ids).await;
+    let cleanup_result = cf.delete_records(&txt_record_ids).await;
+
+    match (result, cleanup_result) {
+        (Ok(tls_config), Ok(())) => {
+            info!("ACME wildcard certificate provisioned successfully");
+            Ok(tls_config)
+        }
+        (Ok(_), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "ACME certificate provisioned, but TXT record cleanup failed: {cleanup_error}"
+        )),
+        (Err(primary_error), Ok(())) => Err(primary_error),
+        (Err(primary_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "{primary_error}; additionally, TXT record cleanup failed: {cleanup_error}"
+        )),
+    }
+}
+
+async fn provision_wildcard_cert_inner(
+    config: &Config,
+    cf: &CloudflareClient,
+    txt_record_ids: &mut Vec<String>,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use instant_acme::{
+        Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
+        OrderStatus,
+    };
 
     // 1. Create or restore ACME account
     let account_path = PathBuf::from(&config.tls.cert_dir).join("acme_account.json");
@@ -175,7 +199,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
         .map_err(|e| anyhow::anyhow!("ACME order: {}", e))?;
 
     // 3. Get authorizations and find DNS-01 challenges, create TXT records
-    let mut txt_record_ids: Vec<String> = Vec::new();
     let challenge_domain = format!("_acme-challenge.{}", config.server.domain);
 
     {
@@ -226,14 +249,11 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
             OrderStatus::Pending => {
                 attempts += 1;
                 if attempts > 30 {
-                    // Clean up TXT records before bailing
-                    let _ = cf.delete_txt_records(&challenge_domain).await;
                     anyhow::bail!("ACME order still pending after 150s");
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             OrderStatus::Invalid => {
-                let _ = cf.delete_txt_records(&challenge_domain).await;
                 anyhow::bail!("ACME order became invalid");
             }
             OrderStatus::Valid => {
@@ -241,7 +261,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
                 break;
             }
             status => {
-                let _ = cf.delete_txt_records(&challenge_domain).await;
                 anyhow::bail!("Unexpected ACME order status: {:?}", status);
             }
         }
@@ -277,13 +296,11 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
                 OrderStatus::Processing => {
                     finalize_attempts += 1;
                     if finalize_attempts > 20 {
-                        let _ = cf.delete_txt_records(&challenge_domain).await;
                         anyhow::bail!("ACME order still processing after finalize");
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 status => {
-                    let _ = cf.delete_txt_records(&challenge_domain).await;
                     anyhow::bail!("ACME order failed after finalize: {:?}", status);
                 }
             }
@@ -300,10 +317,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
     // 9. Save to disk
     let key_pem = private_key.serialize_pem();
     save_cert(&cert_pem, &key_pem, &config.tls.cert_dir)?;
-
-    // 10. Clean up TXT records
-    cf.delete_txt_records(&challenge_domain).await?;
-    info!("ACME wildcard certificate provisioned successfully");
 
     // Load the newly saved cert
     let cert_path = PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
