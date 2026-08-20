@@ -261,6 +261,8 @@ mod tests {
                 max_tunnels: 10,
                 tunnel_idle_timeout_secs: 300,
                 metrics_port: 0, // disabled in tests
+                max_request_body_bytes: 16 * 1024 * 1024,
+                max_response_body_bytes: 16 * 1024 * 1024,
             },
             auth: config::AuthConfig {
                 secret: TEST_SECRET.to_string(),

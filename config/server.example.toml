@@ -25,6 +25,12 @@ max_tunnels = 100
 # Maximum tunnel idle time before server closes it
 tunnel_idle_timeout_secs = 300
 
+# Hard limit for an HTTP request body accepted by the public proxy (bytes)
+max_request_body_bytes = 16777216
+
+# Hard limit for an HTTP response body read from a tunnel (bytes)
+max_response_body_bytes = 16777216
+
 [auth]
 # Secret for signing/verifying JWTs (generate with: openssl rand -hex 32)
 # REQUIRED — must be at least 32 characters. No default.

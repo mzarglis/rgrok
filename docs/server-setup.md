@@ -73,6 +73,8 @@ http_port = 80
 tcp_port_range = [10000, 20000]
 max_tunnels = 100
 tunnel_idle_timeout_secs = 300
+max_request_body_bytes = 16777216  # 16 MiB public HTTP upload limit
+max_response_body_bytes = 16777216 # 16 MiB public HTTP response limit
 
 [auth]
 # Generate with: openssl rand -hex 32

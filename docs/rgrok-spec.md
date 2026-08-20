@@ -281,7 +281,7 @@ rgrok uses a **dual-mode proxy** strategy to balance performance with features:
 
 #### `hyper` keeps it lightweight
 
-`hyper` is already an indirect dependency via `axum`. It adds no new binary size. Its HTTP/1.1 parser (`httparse`) is one of the fastest in any language — benchmarked at >1 GB/s parsing throughput. Request bodies are streamed (not buffered), so a 10 GB file upload passes through with constant memory usage.
+`hyper` is already an indirect dependency via `axum`. It adds no new binary size. Its HTTP/1.1 parser (`httparse`) is one of the fastest in any language — benchmarked at >1 GB/s parsing throughput. Public HTTP request and response bodies are bounded by configurable server limits (16 MiB by default), while inspection capture remains capped at 1 MiB.
 
 ### 4.3 Proxy Stream Protocol
 
@@ -916,6 +916,10 @@ max_tunnels = 100
 
 # Maximum tunnel idle time before server closes it
 tunnel_idle_timeout_secs = 300
+
+# Hard public HTTP request/response body limits (16 MiB each)
+max_request_body_bytes = 16777216
+max_response_body_bytes = 16777216
 
 [auth]
 # Secret for signing/verifying JWTs (generate with: openssl rand -hex 32)

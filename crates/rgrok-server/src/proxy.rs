@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, HOST};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, HOST};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +20,27 @@ use crate::tunnel_manager::{ServerState, TunnelSession};
 
 const MAX_RESPONSE_HEADERS: usize = 65_536;
 const READ_BUFFER_SIZE: usize = 8_192;
+const CLOSE_DELIMITED_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyReadError {
+    Read,
+    TooLarge,
+}
+
+async fn collect_body_limited<B>(body: B, limit: usize) -> Result<Bytes, BodyReadError>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            Err(BodyReadError::TooLarge)
+        }
+        Err(_) => Err(BodyReadError::Read),
+    }
+}
 
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
@@ -208,6 +229,40 @@ async fn proxy_http_request(
     // Only authenticated public traffic keeps an idle tunnel alive.
     tunnel.touch();
 
+    let max_request_body_bytes = state.config.server.max_request_body_bytes;
+    if req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > max_request_body_bytes)
+    {
+        return Ok(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body too large",
+        ));
+    }
+
+    // Hyper has decoded the public framing. Bound collection before opening a
+    // tunnel stream so a slow/oversized upload cannot occupy client capacity.
+    let (parts, body) = req.into_parts();
+    let method_str_for_metrics = parts.method.to_string();
+    let body_bytes = match collect_body_limited(body, max_request_body_bytes).await {
+        Ok(body_bytes) => body_bytes,
+        Err(BodyReadError::TooLarge) => {
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large",
+            ));
+        }
+        Err(BodyReadError::Read) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Failed to read request body",
+            ));
+        }
+    };
+
     // Request a proxy stream from the client
     let mut proxy_stream = match request_proxy_stream(&tunnel).await {
         Some(s) => s,
@@ -222,21 +277,6 @@ async fn proxy_http_request(
     let start = std::time::Instant::now();
     let inspect = tunnel.options.inspect;
     // captured after parts destructure
-
-    // Hyper has already decoded the public request body (including chunked bodies). Read it
-    // before serializing so the local service receives one unambiguous HTTP/1.1 framing mode.
-    let (parts, body) = req.into_parts();
-    let method_str_for_metrics: String = parts.method.to_string();
-
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "Failed to read request body",
-            ));
-        }
-    };
 
     // Capture request metadata if inspection is enabled
     let capture_id = if inspect {
@@ -303,7 +343,13 @@ async fn proxy_http_request(
 
     // Parse exactly one response. Content-Length and chunked responses complete without waiting
     // for the local TCP connection to close; only a genuinely close-delimited response reads EOF.
-    let parsed_response = match read_http_response(&mut proxy_stream, &parts.method).await {
+    let parsed_response = match read_http_response(
+        &mut proxy_stream,
+        &parts.method,
+        state.config.server.max_response_body_bytes,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(_) => {
             return Ok(error_response(
@@ -442,6 +488,7 @@ struct ParsedHttpResponse {
 async fn read_http_response<S>(
     stream: &mut S,
     request_method: &Method,
+    max_body_bytes: usize,
 ) -> anyhow::Result<ParsedHttpResponse>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -472,19 +519,25 @@ where
         });
     }
 
-    let transfer_encoding = header_values(&headers, "transfer-encoding");
-    let chunked = transfer_encoding
+    let transfer_codings = header_values(&headers, "transfer-encoding")
         .iter()
         .flat_map(|value| value.split(','))
-        .last()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("chunked"));
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !transfer_codings.is_empty()
+        && (transfer_codings.len() != 1 || !transfer_codings[0].eq_ignore_ascii_case("chunked"))
+    {
+        anyhow::bail!("unsupported Transfer-Encoding");
+    }
+    let chunked = !transfer_codings.is_empty();
 
     let body = if chunked {
-        read_chunked_body(stream, &mut buffered).await?
+        read_chunked_body(stream, &mut buffered, max_body_bytes).await?
     } else if let Some(content_length) = parse_content_length(&headers)? {
-        read_fixed_body(stream, &mut buffered, content_length).await?
+        read_fixed_body(stream, &mut buffered, content_length, max_body_bytes).await?
     } else {
-        read_close_delimited_body(stream, &mut buffered).await?
+        read_close_delimited_body(stream, &mut buffered, max_body_bytes).await?
     };
 
     Ok(ParsedHttpResponse {
@@ -502,6 +555,9 @@ where
     let mut temp = [0u8; READ_BUFFER_SIZE];
     loop {
         if let Some(position) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+            if position + 4 > MAX_RESPONSE_HEADERS {
+                anyhow::bail!("response headers too large");
+            }
             return Ok(position + 4);
         }
         if buffered.len() >= MAX_RESPONSE_HEADERS {
@@ -512,6 +568,11 @@ where
             anyhow::bail!("response ended before headers");
         }
         buffered.extend_from_slice(&temp[..n]);
+        if buffered.len() > MAX_RESPONSE_HEADERS
+            && !buffered.windows(4).any(|window| window == b"\r\n\r\n")
+        {
+            anyhow::bail!("response headers too large");
+        }
     }
 }
 
@@ -599,10 +660,14 @@ async fn read_fixed_body<S>(
     stream: &mut S,
     buffered: &mut Vec<u8>,
     content_length: usize,
+    max_body_bytes: usize,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
+    if content_length > max_body_bytes {
+        anyhow::bail!("response body exceeds configured limit");
+    }
     let mut body = Vec::with_capacity(content_length.min(READ_BUFFER_SIZE * 2));
     body.extend(take_buffered(buffered, content_length));
     while body.len() < content_length {
@@ -634,7 +699,11 @@ where
     }
 }
 
-async fn read_chunked_body<S>(stream: &mut S, buffered: &mut Vec<u8>) -> anyhow::Result<Vec<u8>>
+async fn read_chunked_body<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    max_body_bytes: usize,
+) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -658,6 +727,10 @@ where
             return Ok(body);
         }
 
+        if size > max_body_bytes.saturating_sub(body.len()) {
+            anyhow::bail!("response body exceeds configured limit");
+        }
+
         ensure_buffered(stream, buffered, size).await?;
         body.extend(take_buffered(buffered, size));
         ensure_buffered(stream, buffered, 2).await?;
@@ -670,16 +743,25 @@ where
 async fn read_close_delimited_body<S>(
     stream: &mut S,
     buffered: &mut Vec<u8>,
+    max_body_bytes: usize,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut body = std::mem::take(buffered);
+    if body.len() > max_body_bytes {
+        anyhow::bail!("response body exceeds configured limit");
+    }
     let mut temp = [0u8; READ_BUFFER_SIZE];
     loop {
-        let n = stream.read(&mut temp).await?;
+        let n = tokio::time::timeout(CLOSE_DELIMITED_READ_TIMEOUT, stream.read(&mut temp))
+            .await
+            .map_err(|_| anyhow::anyhow!("close-delimited response timed out"))??;
         if n == 0 {
             return Ok(body);
+        }
+        if n > max_body_bytes.saturating_sub(body.len()) {
+            anyhow::bail!("response body exceeds configured limit");
         }
         body.extend_from_slice(&temp[..n]);
     }
@@ -976,7 +1058,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            read_http_response(&mut stream, &Method::GET),
+            read_http_response(&mut stream, &Method::GET, usize::MAX),
         )
         .await
         .expect("Content-Length response should not wait for EOF")
@@ -995,7 +1077,9 @@ mod tests {
             .await
             .unwrap();
 
-        let response = read_http_response(&mut stream, &Method::GET).await.unwrap();
+        let response = read_http_response(&mut stream, &Method::GET, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(response.body, b"hello world");
         assert_eq!(
             response.headers[0],
@@ -1012,7 +1096,7 @@ mod tests {
         .await
         .unwrap();
 
-        let response = read_http_response(&mut stream, &Method::POST)
+        let response = read_http_response(&mut stream, &Method::POST, usize::MAX)
             .await
             .unwrap();
         assert_eq!(response.status_code, 200);
@@ -1025,7 +1109,7 @@ mod tests {
         peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
             .await
             .unwrap();
-        let response = read_http_response(&mut stream, &Method::HEAD)
+        let response = read_http_response(&mut stream, &Method::HEAD, usize::MAX)
             .await
             .unwrap();
         assert!(response.body.is_empty());
@@ -1034,7 +1118,9 @@ mod tests {
         peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
             .await
             .unwrap();
-        let response = read_http_response(&mut stream, &Method::GET).await.unwrap();
+        let response = read_http_response(&mut stream, &Method::GET, usize::MAX)
+            .await
+            .unwrap();
         assert!(response.body.is_empty());
     }
 

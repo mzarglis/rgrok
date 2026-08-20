@@ -31,6 +31,12 @@ pub struct ServerConfig {
     pub tunnel_idle_timeout_secs: u64,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Maximum HTTP request body accepted by the public proxy.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// Maximum HTTP response body read from a tunnel by the public proxy.
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +112,12 @@ fn default_tunnel_idle_timeout() -> u64 {
 fn default_metrics_port() -> u16 {
     9090
 }
+fn default_max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_max_response_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
 fn default_acme_env() -> String {
     "production".to_string()
 }
@@ -169,6 +181,12 @@ impl Config {
                 anyhow::bail!("server.public_ip must be a valid IPv4 address");
             }
         }
+        if self.server.max_request_body_bytes == 0 {
+            anyhow::bail!("server.max_request_body_bytes must be greater than zero");
+        }
+        if self.server.max_response_body_bytes == 0 {
+            anyhow::bail!("server.max_response_body_bytes must be greater than zero");
+        }
         Ok(())
     }
 }
@@ -207,6 +225,8 @@ impl Default for Config {
                 max_tunnels: default_max_tunnels(),
                 tunnel_idle_timeout_secs: default_tunnel_idle_timeout(),
                 metrics_port: default_metrics_port(),
+                max_request_body_bytes: default_max_request_body_bytes(),
+                max_response_body_bytes: default_max_response_body_bytes(),
             },
             auth: AuthConfig {
                 secret: "a".repeat(32),
@@ -280,6 +300,8 @@ acme_email = "test@example.com"
         assert_eq!(config.server.max_tunnels, 100);
         assert_eq!(config.server.tunnel_idle_timeout_secs, 300);
         assert_eq!(config.server.metrics_port, 9090);
+        assert_eq!(config.server.max_request_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.server.max_response_body_bytes, 16 * 1024 * 1024);
         assert_eq!(config.tls.acme_env, "production");
         assert_eq!(config.tls.cert_dir, "/var/lib/rgrok/certs");
         assert_eq!(config.cloudflare.dns_ttl, 1);
@@ -447,5 +469,22 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
         config.server.tunnel_idle_timeout_secs = 0;
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("tunnel_idle_timeout_secs"));
+    }
+
+    #[test]
+    fn test_zero_http_body_limit_rejected() {
+        let mut config = Config::default();
+        config.server.max_request_body_bytes = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("max_request_body_bytes must be greater than zero"));
+
+        config.server.max_request_body_bytes = 1;
+        config.server.max_response_body_bytes = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("max_response_body_bytes must be greater than zero"));
     }
 }
