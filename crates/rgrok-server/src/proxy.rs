@@ -510,14 +510,18 @@ async fn handle_http_connection(
     Ok(())
 }
 
-/// Request a proxy stream from the client via the tunnel's pending_streams mechanism.
+/// Request a proxy stream from the client via the tunnel's connection-scoped
+/// pending-stream registry.
 /// Returns the yamux stream (wrapped for tokio compat) once the client opens it, or None on timeout.
 async fn request_proxy_stream(
     tunnel: &TunnelSession,
 ) -> Option<tokio_util::compat::Compat<yamux::Stream>> {
     let correlation_id = tunnel.next_correlation_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tunnel.pending_streams.insert(correlation_id, tx);
+    tunnel
+        .stream_state
+        .pending_streams
+        .insert(correlation_id, tx);
 
     // Tell the client to open a proxy stream
     if tunnel
@@ -529,7 +533,7 @@ async fn request_proxy_stream(
         .await
         .is_err()
     {
-        tunnel.pending_streams.remove(&correlation_id);
+        tunnel.stream_state.pending_streams.remove(&correlation_id);
         return None;
     }
 
@@ -537,7 +541,7 @@ async fn request_proxy_stream(
     match tokio::time::timeout(Duration::from_secs(10), rx).await {
         Ok(Ok(stream)) => Some(stream.compat()),
         _ => {
-            tunnel.pending_streams.remove(&correlation_id);
+            tunnel.stream_state.pending_streams.remove(&correlation_id);
             None
         }
     }

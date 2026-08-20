@@ -581,7 +581,10 @@ mod tests {
         let tunnel = state.tunnels.get("e2e").unwrap().clone();
         let correlation_id = tunnel.next_correlation_id();
         let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
-        tunnel.pending_streams.insert(correlation_id, stream_tx);
+        tunnel
+            .stream_state
+            .pending_streams
+            .insert(correlation_id, stream_tx);
 
         // Send StreamOpen to client via the tunnel's control channel
         tunnel

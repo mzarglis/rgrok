@@ -137,7 +137,30 @@ impl ServerState {
     }
 }
 
-/// Represents an active tunnel session from a connected client
+/// Stream correlation state is shared by every tunnel created on the same
+/// authenticated control connection. This keeps the correlation namespace
+/// scoped to that connection rather than to an individual tunnel.
+pub struct ConnectionStreamState {
+    /// Next correlation ID for a proxy stream on this control connection.
+    pub next_correlation_id: AtomicU32,
+    /// Open yamux streams awaiting the client: correlation_id -> stream sender.
+    pub pending_streams: DashMap<u32, oneshot::Sender<yamux::Stream>>,
+}
+
+impl ConnectionStreamState {
+    pub fn new() -> Self {
+        Self {
+            next_correlation_id: AtomicU32::new(1),
+            pending_streams: DashMap::new(),
+        }
+    }
+
+    pub fn next_correlation_id(&self) -> u32 {
+        self.next_correlation_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Represents an active tunnel session from a connected client.
 pub struct TunnelSession {
     pub id: String,
     #[allow(dead_code)]
@@ -150,17 +173,16 @@ pub struct TunnelSession {
     pub created_at: Instant,
     /// Sink to send messages to the connected client
     pub control_tx: mpsc::Sender<ServerMsg>,
-    /// Next correlation ID (atomic counter)
-    pub next_correlation_id: AtomicU32,
-    /// Open yamux streams awaiting client: correlation_id -> oneshot sender for yamux::Stream
-    pub pending_streams: DashMap<u32, oneshot::Sender<yamux::Stream>>,
+    /// Stream correlation state shared with the other tunnels on this client
+    /// control connection.
+    pub stream_state: Arc<ConnectionStreamState>,
     /// Cached last successful Authorization header value (fast-path to skip bcrypt)
     pub cached_auth_header: Mutex<Option<String>>,
 }
 
 impl TunnelSession {
     pub fn next_correlation_id(&self) -> u32 {
-        self.next_correlation_id.fetch_add(1, Ordering::Relaxed)
+        self.stream_state.next_correlation_id()
     }
 }
 
@@ -206,8 +228,7 @@ mod tests {
             options: TunnelOptions::default(),
             created_at: Instant::now(),
             control_tx: tx,
-            next_correlation_id: AtomicU32::new(0),
-            pending_streams: DashMap::new(),
+            stream_state: Arc::new(ConnectionStreamState::new()),
             cached_auth_header: Mutex::new(None),
         })
     }
