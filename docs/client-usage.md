@@ -35,6 +35,9 @@ Example config file:
 [server]
 host = "tunnel.example.com"
 port = 7835
+# Production default: wss:// with certificate and hostname verification.
+# Set true only when connecting to a local development server over ws://.
+insecure = false
 
 [auth]
 token = "eyJ..."
@@ -62,7 +65,7 @@ rgrok http 3000
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--subdomain <name>` | Request a specific subdomain | Random |
-| `--auth <user:pass>` | Require HTTP basic auth on the tunnel | None |
+| `--auth <USER:PASSWORD>` | Require HTTP basic auth on the tunnel (password may contain `:`) | None |
 | `--host-header <host>` | Rewrite the `Host` header sent to your local server | Unchanged |
 | `--no-inspect` | Disable request capture (lower memory usage) | Inspect on |
 | `--inspect-port <port>` | Port for the local inspection web UI | `4040` |
@@ -81,6 +84,9 @@ rgrok http 3000 --host-header localhost:3000
 # Disable inspection
 rgrok http 3000 --no-inspect
 ```
+
+The username and password must both be non-empty. If the password contains a
+colon, everything after the first colon is treated as the password.
 
 ---
 
@@ -143,13 +149,21 @@ These flags apply to all commands:
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--config <path>` | Path to config file | `~/.config/rgrok/config.toml` |
-| `--server <host:port>` | Override server address for this invocation | From config |
+| `--server <host:port>` | Override server address for this invocation; accepts `ws://` or `wss://` to select transport | From config |
+| `--insecure` | Use plaintext `ws://` for local development; the auth token is sent unencrypted | Off |
 
 **Example:**
 ```bash
 # One-off tunnel to a different server without editing config
 rgrok --server other-server.example.com:7835 http 3000
+
+# Local development only: explicitly opt in to plaintext control transport
+rgrok --server ws://127.0.0.1:7835 --insecure http 3000
 ```
+
+The client uses `wss://` and verifies the server certificate and hostname by
+default. Do not use `--insecure` or `server.insecure = true` for production
+servers: the authentication token is transmitted over plaintext WebSocket.
 
 ---
 
@@ -163,6 +177,14 @@ When a tunnel is open, a local web UI is available at `http://localhost:4040` (o
 - A **Replay** button to re-send any captured request
 
 Inspection is enabled by default for `http` tunnels. Disable it with `--no-inspect` or set `inspect = false` in the config `[defaults]` section.
+
+The client UI binds to loopback only. It protects replay and clear mutations
+with a per-process CSRF token and removes credential-bearing headers (such as
+`Authorization`, cookies, API keys, and tokens) from captures and replays.
+Request and response bodies can still contain sensitive application data; use
+`--no-inspect` when body capture is not appropriate. The server UI follows the
+same redaction rules and additionally requires `inspect.ui_auth_token` for any
+non-loopback bind.
 
 ---
 

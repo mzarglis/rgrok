@@ -66,17 +66,21 @@ Edit `/etc/rgrok/server.toml`:
 ```toml
 [server]
 domain = "tunnel.example.com"   # your domain
+# public_ip = "203.0.113.10"      # required only when per_tunnel_dns = true
 control_port = 7835
 https_port = 443
 http_port = 80
 tcp_port_range = [10000, 20000]
 max_tunnels = 100
 tunnel_idle_timeout_secs = 300
+max_request_body_bytes = 16777216  # 16 MiB public HTTP upload limit
+max_response_body_bytes = 16777216 # 16 MiB public HTTP response limit
 
 [auth]
 # Generate with: openssl rand -hex 32
 secret = "CHANGEME_replace_with_output_of_openssl_rand_hex_32"
 tokens = []
+# When non-empty, only these exact generated token strings may authenticate.
 
 [tls]
 acme_env = "production"         # use "staging" for testing to avoid rate limits
@@ -88,6 +92,8 @@ api_token = "your-cloudflare-api-token"
 zone_id = "your-cloudflare-zone-id"
 dns_ttl = 1
 per_tunnel_dns = false          # wildcard A record is sufficient (recommended)
+# Set per_tunnel_dns = true only with server.public_ip and Cloudflare DNS credentials.
+# Existing configs enabling per_tunnel_dns must add public_ip before upgrading.
 
 [logging]
 level = "info"
@@ -188,11 +194,41 @@ key_file  = "/etc/ssl/private/wildcard.key"
 
 The server performs hot-reload every 12 hours — if the cert on disk changes, it picks it up without a restart.
 
+## Inspection UI security
+
+The server inspection UI is disabled by default. If enabled, keep
+`[inspect].ui_bind = "127.0.0.1"` (or `::1`) for the no-configuration local
+developer workflow. Captures include request and response bodies, so do not
+expose this listener directly to the Internet.
+
+If the UI must be reachable on another interface, configure a long random
+`[inspect].ui_auth_token`. Startup fails closed when a non-loopback bind has no
+token. The UI accepts `Authorization: Bearer <token>` for API clients and HTTP
+Basic authentication in a browser (username `rgrok`, password the token).
+All routes, including the dashboard and SSE stream, use the same check, and
+mutating requests require the UI's CSRF header. Existing deployments that bind
+the UI publicly must add the token before upgrading; no token is needed for the
+default loopback binding.
+
 ## Docker Deployment
+
+The image does not contain a server configuration or a default JWT signing
+secret. Create `/etc/rgrok/server.toml` on the host, set `auth.secret` to a
+fresh value from `openssl rand -hex 32`, and mount that directory read-only.
+Starting the image without this file fails closed with an actionable error.
 
 ```bash
 # Build
 docker build -t rgrok-server -f deploy/Dockerfile .
+
+# Prepare an operator-managed config (edit domain, TLS, and other settings).
+sudo cp config/server.example.toml /etc/rgrok/server.toml
+openssl rand -hex 32  # put this output in /etc/rgrok/server.toml as auth.secret
+# The image pins its non-root rgrok user and group to UID/GID 10001.
+sudo chown root:10001 /etc/rgrok/server.toml
+sudo chmod 640 /etc/rgrok/server.toml
+sudo mkdir -p /var/lib/rgrok
+sudo chown 10001:10001 /var/lib/rgrok
 
 # Run (mount your config and cert storage)
 docker run -d \

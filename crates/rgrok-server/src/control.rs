@@ -1,18 +1,35 @@
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use rgrok_proto::messages::*;
 use rgrok_proto::transport::{read_msg_from_stream, write_msg_to_stream, yamux_config, WsCompat};
-use rgrok_proto::{generate_subdomain, spawn_yamux_driver, validate_subdomain};
+use rgrok_proto::{
+    generate_subdomain, spawn_yamux_driver, validate_subdomain, CONTROL_PROTOCOL_VERSION,
+};
 
 use crate::auth;
-use crate::tunnel_manager::{ServerState, TunnelSession};
+use crate::tunnel_manager::{ConnectionStreamState, ServerState, TunnelSession};
+
+struct ActiveWebSocketGuard(prometheus::IntGauge);
+
+impl ActiveWebSocketGuard {
+    fn new(gauge: &prometheus::IntGauge) -> Self {
+        gauge.inc();
+        Self(gauge.clone())
+    }
+}
+
+impl Drop for ActiveWebSocketGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
 
 /// Start the control plane listener.
 pub async fn serve(
@@ -22,6 +39,26 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let bind_addr = listener.local_addr()?;
     info!("Control plane listening on {}", bind_addr);
+
+    // Reap idle tunnels even when no public request arrives to trigger a
+    // routing lookup. The task exits with the shared server cancellation token.
+    let reaper_state = state.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(
+            reaper_state
+                .config
+                .server
+                .tunnel_idle_timeout_secs
+                .clamp(1, 60),
+        );
+        let mut interval = tokio::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => reaper_state.reap_idle_tunnels(Instant::now()).await,
+                _ = reaper_state.cancel.cancelled() => break,
+            }
+        }
+    });
 
     loop {
         let (tcp_stream, peer_addr) = tokio::select! {
@@ -33,9 +70,19 @@ pub async fn serve(
         };
         let state = state.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let mut tls_config_rx = state.tls_config_rx.clone();
 
         tokio::spawn(async move {
-            if let Some(acceptor) = tls_acceptor {
+            if let Some(initial_acceptor) = tls_acceptor {
+                // Build an acceptor from the latest config for every new
+                // connection so certificate renewal takes effect without a
+                // listener restart. Keep the startup acceptor as a fallback
+                // for the short window before the initial watch update.
+                let acceptor = tls_config_rx
+                    .borrow_and_update()
+                    .clone()
+                    .map(TlsAcceptor::from)
+                    .unwrap_or(initial_acceptor);
                 match acceptor.accept(tcp_stream).await {
                     Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
                         Ok(ws) => handle_client(ws, state).await,
@@ -64,12 +111,12 @@ async fn handle_client<S>(ws: tokio_tungstenite::WebSocketStream<S>, state: Arc<
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    state.metrics.ws_connections_active.inc();
+    let _active_connection = ActiveWebSocketGuard::new(&state.metrics.ws_connections_active);
 
     let ws_compat = WsCompat::new(ws);
     let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Server);
 
-    let (_mux_control, mut inbound_rx, driver_handle) = spawn_yamux_driver(mux);
+    let (_mux_control, mut inbound_rx, mut driver_handle) = spawn_yamux_driver(mux);
 
     // Accept stream 0 = control channel (with timeout)
     let mut ctrl_stream =
@@ -102,7 +149,7 @@ where
         }
     };
 
-    let (token, _version) = match auth_msg {
+    let (token, version) = match auth_msg {
         ClientMsg::Auth { token, version } => (token, version),
         _ => {
             warn!("First message was not Auth");
@@ -114,9 +161,49 @@ where
                 },
             )
             .await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+            abort_driver_after_flush(&mut driver_handle).await;
             return;
         }
     };
+
+    if version != CONTROL_PROTOCOL_VERSION {
+        warn!(client = %version, server = %CONTROL_PROTOCOL_VERSION, "Control protocol version mismatch");
+        let _ = write_msg_to_stream(
+            &mut ctrl_stream,
+            &ServerMsg::AuthErr {
+                reason: format!(
+                    "protocol version mismatch: client={}, server={}",
+                    version, CONTROL_PROTOCOL_VERSION
+                ),
+            },
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
+        return;
+    }
+
+    if !state.config.auth.tokens.is_empty()
+        && !state
+            .config
+            .auth
+            .tokens
+            .iter()
+            .any(|allowed| allowed == &token)
+    {
+        warn!("Auth token is not in the configured allowlist");
+        let _ = write_msg_to_stream(
+            &mut ctrl_stream,
+            &ServerMsg::AuthErr {
+                reason: "token is not authorized".to_string(),
+            },
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
+        return;
+    }
 
     // Step 2: Validate JWT
     let claims = match auth::validate_token(&token, &state.config.auth.secret) {
@@ -130,6 +217,8 @@ where
                 },
             )
             .await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+            abort_driver_after_flush(&mut driver_handle).await;
             return;
         }
     };
@@ -144,6 +233,8 @@ where
             },
         )
         .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
         return;
     }
 
@@ -166,24 +257,46 @@ where
 
     // Step 4: Set up control message channel
     let (control_tx, mut control_rx) = mpsc::channel::<ServerMsg>(64);
+    // All tunnels registered by this authenticated client share one
+    // correlation namespace and pending-stream registry. The accept task below
+    // receives this exact registry, so an inbound stream can never resolve a
+    // request belonging to another WebSocket connection.
+    let stream_state = Arc::new(ConnectionStreamState::new());
+    let mut revocation_epoch = state.revocation_epoch.subscribe();
 
     // Track resources for cleanup
-    let mut registered_subdomains: Vec<String> = Vec::new();
-    let mut registered_tcp_ports: Vec<u16> = Vec::new();
+    let mut registered_subdomains: Vec<(String, Arc<TunnelSession>)> = Vec::new();
+    let mut registered_tcp_ports: Vec<(u16, Arc<TunnelSession>)> = Vec::new();
 
     // Spawn task to accept proxy data streams from client
-    let accept_state = state.clone();
+    let accept_stream_state = stream_state.clone();
     let accept_handle = tokio::spawn(async move {
         while let Some(stream) = inbound_rx.recv().await {
-            let state = accept_state.clone();
+            let stream_state = accept_stream_state.clone();
             tokio::spawn(async move {
-                handle_proxy_data_stream(stream, state).await;
+                handle_proxy_data_stream(stream, stream_state).await;
             });
         }
     });
 
     // Step 5: Main control loop — interleave reads and writes
     loop {
+        // Catch a revocation reload that raced the next select call.
+        if state.is_jti_revoked(&claims.jti).await {
+            warn!(jti = %claims.jti, "Active session token has been revoked");
+            if let Err(e) = write_msg_to_stream(
+                &mut ctrl_stream,
+                &ServerMsg::Error {
+                    code: 401,
+                    message: "token has been revoked".to_string(),
+                },
+            )
+            .await
+            {
+                warn!("Failed to send revocation error to client: {}", e);
+            }
+            break;
+        }
         tokio::select! {
             result = read_msg_from_stream::<ClientMsg>(&mut ctrl_stream) => {
                 let msg = match result {
@@ -192,6 +305,7 @@ where
                 };
                 handle_control_msg(
                     msg, &state, &control_tx,
+                    &stream_state,
                     &mut registered_subdomains, &mut registered_tcp_ports,
                 ).await;
             }
@@ -204,24 +318,57 @@ where
                 info!(session_id = %session_id, "Graceful shutdown: closing client session");
                 break;
             }
+            result = revocation_epoch.changed() => {
+                if result.is_err() || state.is_jti_revoked(&claims.jti).await {
+                    warn!(jti = %claims.jti, "Active session token has been revoked");
+                    if let Err(e) = write_msg_to_stream(
+                        &mut ctrl_stream,
+                        &ServerMsg::Error {
+                            code: 401,
+                            message: "token has been revoked".to_string(),
+                        },
+                    )
+                    .await
+                    {
+                        warn!("Failed to send revocation error to client: {}", e);
+                    }
+                    break;
+                }
+            }
         }
     }
 
     // Cleanup
     info!(session_id = %session_id, "Client disconnected, cleaning up tunnels");
-    for subdomain in &registered_subdomains {
-        state.unregister_tunnel(subdomain);
+    for (subdomain, session) in &registered_subdomains {
+        if let Some(removed) = state.unregister_tunnel_if_owner(subdomain, session) {
+            state.delete_dns_record(&removed).await;
+        }
     }
-    for port in &registered_tcp_ports {
-        state.unregister_tcp_tunnel(*port);
+    for (port, expected) in &registered_tcp_ports {
+        if let Some(removed) = state.shutdown_tcp_tunnel_if_owner(*port, expected).await {
+            state.delete_dns_record(&removed).await;
+        }
     }
     accept_handle.abort();
     driver_handle.abort();
-    state.metrics.ws_connections_active.dec();
 }
 
-/// Handle a proxy data stream: read correlation_id header, match to pending_streams
-async fn handle_proxy_data_stream(mut stream: yamux::Stream, state: Arc<ServerState>) {
+async fn abort_driver_after_flush(driver_handle: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_millis(100), &mut *driver_handle)
+        .await
+        .is_err()
+    {
+        driver_handle.abort();
+    }
+}
+
+/// Handle a proxy data stream: read its correlation ID and resolve only the
+/// pending request on the authenticated WebSocket that delivered this stream.
+async fn handle_proxy_data_stream(
+    mut stream: yamux::Stream,
+    stream_state: Arc<ConnectionStreamState>,
+) {
     use futures::AsyncReadExt;
 
     let mut id_buf = [0u8; 4];
@@ -231,20 +378,21 @@ async fn handle_proxy_data_stream(mut stream: yamux::Stream, state: Arc<ServerSt
     }
     let correlation_id = u32::from_be_bytes(id_buf);
 
-    // Resolve the pending oneshot
-    for entry in state.tunnels.iter() {
-        if let Some((_, tx)) = entry.value().pending_streams.remove(&correlation_id) {
-            let _ = tx.send(stream);
-            return;
-        }
+    if !resolve_pending_stream(&stream_state.pending_streams, correlation_id, stream) {
+        warn!(correlation_id, "No pending stream found for correlation ID");
     }
-    for entry in state.tcp_tunnels.iter() {
-        if let Some((_, tx)) = entry.value().pending_streams.remove(&correlation_id) {
-            let _ = tx.send(stream);
-            return;
-        }
+}
+
+/// Resolve a pending stream from a connection-scoped correlation map.
+fn resolve_pending_stream<T>(
+    pending_streams: &dashmap::DashMap<u32, tokio::sync::oneshot::Sender<T>>,
+    correlation_id: u32,
+    stream: T,
+) -> bool {
+    match pending_streams.remove(&correlation_id) {
+        Some((_, tx)) => tx.send(stream).is_ok(),
+        None => false,
     }
-    warn!(correlation_id, "No pending stream found for correlation ID");
 }
 
 /// Process a control message from the client
@@ -252,8 +400,9 @@ async fn handle_control_msg(
     msg: ClientMsg,
     state: &Arc<ServerState>,
     control_tx: &mpsc::Sender<ServerMsg>,
-    registered_subdomains: &mut Vec<String>,
-    registered_tcp_ports: &mut Vec<u16>,
+    stream_state: &Arc<ConnectionStreamState>,
+    registered_subdomains: &mut Vec<(String, Arc<TunnelSession>)>,
+    registered_tcp_ports: &mut Vec<(u16, Arc<TunnelSession>)>,
 ) {
     match msg {
         ClientMsg::TunnelRequest {
@@ -279,10 +428,59 @@ async fn handle_control_msg(
                 None => generate_subdomain(),
             };
 
+            // Reserve the name or port before any potentially slow setup so
+            // in-flight requests consume capacity just like active tunnels.
+            let tcp_port = match &tunnel_type {
+                TunnelType::Tcp { remote_port } => {
+                    let port = match state.reserve_tcp_port(*remote_port, &id) {
+                        Ok(port) => port,
+                        Err(e) => {
+                            let code = match e {
+                                rgrok_proto::TunnelError::TcpPortOutOfRange { .. } => 400,
+                                rgrok_proto::TunnelError::TcpPortTaken { .. } => 409,
+                                rgrok_proto::TunnelError::NoPortsAvailable { .. } => 503,
+                                rgrok_proto::TunnelError::CapacityExceeded { .. } => 503,
+                                _ => 500,
+                            };
+                            let _ = control_tx
+                                .send(ServerMsg::Error {
+                                    code,
+                                    message: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+                    Some(port)
+                }
+                _ => {
+                    if let Err(e) = state.reserve_http_tunnel(&assigned_subdomain, &id) {
+                        let code = match &e {
+                            rgrok_proto::TunnelError::CapacityExceeded { .. } => 503,
+                            rgrok_proto::TunnelError::SubdomainTaken { .. } => 409,
+                            _ => 500,
+                        };
+                        let _ = control_tx
+                            .send(ServerMsg::Error {
+                                code,
+                                message: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                    None
+                }
+            };
+
             let basic_auth_hash = if let Some(ref ba) = basic_auth {
                 match auth::hash_basic_auth_password(&ba.password) {
                     Ok(h) => Some(h),
                     Err(e) => {
+                        if let Some(port) = tcp_port {
+                            state.release_tcp_port_reservation(port, &id);
+                        } else {
+                            state.release_http_tunnel(&assigned_subdomain, &id);
+                        }
                         let _ = control_tx
                             .send(ServerMsg::Error {
                                 code: 500,
@@ -295,31 +493,42 @@ async fn handle_control_msg(
             } else {
                 None
             };
+            let basic_auth_username = basic_auth.as_ref().map(|ba| ba.username.clone());
+            // The session retains only the username and bcrypt hash.
+            drop(basic_auth);
 
-            let public_url = match &tunnel_type {
+            let dns_record_id = match &tunnel_type {
                 TunnelType::Http | TunnelType::Https => {
+                    match state.create_dns_record(&assigned_subdomain).await {
+                        Ok(record_id) => record_id,
+                        Err(e) => {
+                            state.release_http_tunnel(&assigned_subdomain, &id);
+                            let _ = control_tx
+                                .send(ServerMsg::Error {
+                                    code: 503,
+                                    message: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                TunnelType::Tcp { .. } => None,
+            };
+
+            let public_url = match (&tunnel_type, tcp_port) {
+                (TunnelType::Http, None) | (TunnelType::Https, None) => {
                     format!(
                         "https://{}.{}",
                         assigned_subdomain, state.config.server.domain
                     )
                 }
-                TunnelType::Tcp { remote_port } => {
-                    let port = match remote_port {
-                        Some(p) => *p,
-                        None => match state.allocate_tcp_port() {
-                            Some(p) => p,
-                            None => {
-                                let _ = control_tx
-                                    .send(ServerMsg::Error {
-                                        code: 503,
-                                        message: "no TCP ports available".to_string(),
-                                    })
-                                    .await;
-                                return;
-                            }
-                        },
-                    };
+                (TunnelType::Tcp { .. }, Some(port)) => {
                     format!("tcp://{}:{}", state.config.server.domain, port)
+                }
+                (TunnelType::Tcp { .. }, None) => unreachable!("TCP port was not reserved"),
+                (TunnelType::Http | TunnelType::Https, Some(_)) => {
+                    unreachable!("HTTP tunnel cannot have a TCP port")
                 }
             };
 
@@ -327,19 +536,60 @@ async fn handle_control_msg(
                 id: id.clone(),
                 tunnel_type: tunnel_type.clone(),
                 subdomain: assigned_subdomain.clone(),
-                basic_auth,
+                basic_auth_username,
                 basic_auth_hash,
                 options,
                 created_at: Instant::now(),
+                last_activity: std::sync::Mutex::new(Instant::now()),
+                active_streams: std::sync::atomic::AtomicUsize::new(0),
+                dns_record_id,
+                idle_cancel: tokio_util::sync::CancellationToken::new(),
                 control_tx: control_tx.clone(),
-                next_correlation_id: AtomicU32::new(1),
-                pending_streams: dashmap::DashMap::new(),
-                cached_auth_header: tokio::sync::Mutex::new(None),
+                stream_state: stream_state.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                listener_stopped: tokio::sync::Mutex::new(None),
+                cached_auth_fingerprint: tokio::sync::Mutex::new(None),
             });
 
             match &tunnel_type {
                 TunnelType::Http | TunnelType::Https => {
                     if let Err(e) = state.register_tunnel(session.clone()) {
+                        state.release_http_tunnel(&assigned_subdomain, &id);
+                        let _ = control_tx
+                            .send(ServerMsg::Error {
+                                code: 409,
+                                message: e.to_string(),
+                            })
+                            .await;
+                        state.delete_dns_record(&session).await;
+                        return;
+                    }
+                    registered_subdomains.push((assigned_subdomain.clone(), session.clone()));
+                }
+                TunnelType::Tcp { .. } => {
+                    let port = tcp_port.expect("TCP port was reserved above");
+                    // Bind before publishing the tunnel. A failed bind is a
+                    // client-visible error and must not result in a TunnelAck.
+                    let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+                        Ok(listener) => listener,
+                        Err(e) => {
+                            state.release_tcp_port_reservation(port, &id);
+                            let _ = control_tx
+                                .send(ServerMsg::Error {
+                                    code: 500,
+                                    message: format!("failed to bind TCP port {}: {}", port, e),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let (listener_stopped_tx, listener_stopped_rx) = oneshot::channel();
+                    *session.listener_stopped.lock().await = Some(listener_stopped_rx);
+
+                    if let Err(e) = state.try_register_tcp_tunnel(port, session.clone()) {
+                        drop(listener);
+                        state.release_tcp_port_reservation(port, &id);
                         let _ = control_tx
                             .send(ServerMsg::Error {
                                 code: 409,
@@ -348,26 +598,28 @@ async fn handle_control_msg(
                             .await;
                         return;
                     }
-                    registered_subdomains.push(assigned_subdomain.clone());
-                }
-                TunnelType::Tcp { .. } => {
-                    if let Some(port_str) = public_url.rsplit(':').next() {
-                        if let Ok(port) = port_str.parse::<u16>() {
-                            state.register_tcp_tunnel(port, session.clone());
-                            registered_tcp_ports.push(port);
+                    registered_tcp_ports.push((port, session.clone()));
 
-                            let tcp_state = state.clone();
-                            let tcp_tunnel = session.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    crate::proxy::serve_tcp_tunnel(tcp_state, port, tcp_tunnel)
-                                        .await
-                                {
-                                    warn!(port, "TCP tunnel listener error: {}", e);
-                                }
-                            });
+                    let tcp_state = state.clone();
+                    let tcp_tunnel = session.clone();
+                    tokio::spawn(async move {
+                        let result = crate::proxy::serve_tcp_tunnel_on_listener(
+                            tcp_state.clone(),
+                            listener,
+                            tcp_tunnel.clone(),
+                        )
+                        .await;
+                        let _ = listener_stopped_tx.send(());
+                        if let Some(removed) =
+                            tcp_state.remove_tcp_tunnel_if_owner(port, &tcp_tunnel)
+                        {
+                            tcp_state.release_tcp_port_reservation(port, &removed.id);
+                            tcp_state.delete_dns_record(&removed).await;
                         }
-                    }
+                        if let Err(e) = result {
+                            warn!(port, "TCP tunnel listener error: {}", e);
+                        }
+                    });
                 }
             }
 
@@ -382,7 +634,12 @@ async fn handle_control_msg(
                 .send(ServerMsg::TunnelAck {
                     id,
                     public_url,
-                    tunnel_type,
+                    tunnel_type: match tunnel_type {
+                        TunnelType::Tcp { .. } => TunnelType::Tcp {
+                            remote_port: tcp_port,
+                        },
+                        other => other,
+                    },
                 })
                 .await;
         }
@@ -396,5 +653,235 @@ async fn handle_control_msg(
         }
 
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::AsyncWriteExt;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    #[tokio::test]
+    async fn colliding_ids_are_scoped_to_their_control_connection() {
+        let (first_client_io, first_server_io) = tokio::io::duplex(64 * 1024);
+        let first_client_conn = yamux::Connection::new(
+            first_client_io.compat(),
+            yamux_config(),
+            yamux::Mode::Client,
+        );
+        let first_server_conn = yamux::Connection::new(
+            first_server_io.compat(),
+            yamux_config(),
+            yamux::Mode::Server,
+        );
+        let (first_control, _first_client_inbound, _first_client_driver) =
+            spawn_yamux_driver(first_client_conn);
+        let (_first_server_control, mut first_server_inbound, _first_server_driver) =
+            spawn_yamux_driver(first_server_conn);
+
+        let (second_client_io, second_server_io) = tokio::io::duplex(64 * 1024);
+        let second_client_conn = yamux::Connection::new(
+            second_client_io.compat(),
+            yamux_config(),
+            yamux::Mode::Client,
+        );
+        let second_server_conn = yamux::Connection::new(
+            second_server_io.compat(),
+            yamux_config(),
+            yamux::Mode::Server,
+        );
+        let (second_control, _second_client_inbound, _second_client_driver) =
+            spawn_yamux_driver(second_client_conn);
+        let (_second_server_control, mut second_server_inbound, _second_server_driver) =
+            spawn_yamux_driver(second_server_conn);
+
+        let first_connection = Arc::new(ConnectionStreamState::new());
+        let second_connection = Arc::new(ConnectionStreamState::new());
+
+        // Each authenticated WebSocket may start at ID 1. The same ID must be
+        // resolved only against the registry belonging to the stream's socket.
+        let first_id = first_connection.next_correlation_id();
+        let second_id = second_connection.next_correlation_id();
+        assert_eq!(first_id, 1);
+        assert_eq!(second_id, 1);
+
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        first_connection.pending_streams.insert(first_id, first_tx);
+        second_connection
+            .pending_streams
+            .insert(second_id, second_tx);
+
+        let mut first_client_stream = first_control.open_stream().await.unwrap();
+        first_client_stream
+            .write_all(&first_id.to_be_bytes())
+            .await
+            .unwrap();
+        first_client_stream.flush().await.unwrap();
+        let first_server_stream =
+            tokio::time::timeout(Duration::from_secs(1), first_server_inbound.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        handle_proxy_data_stream(first_server_stream, first_connection).await;
+        assert!(first_rx.try_recv().is_ok());
+        assert!(second_rx.try_recv().is_err());
+        assert!(second_connection.pending_streams.contains_key(&second_id));
+
+        let mut second_client_stream = second_control.open_stream().await.unwrap();
+        second_client_stream
+            .write_all(&second_id.to_be_bytes())
+            .await
+            .unwrap();
+        second_client_stream.flush().await.unwrap();
+        let second_server_stream =
+            tokio::time::timeout(Duration::from_secs(1), second_server_inbound.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        handle_proxy_data_stream(second_server_stream, second_connection).await;
+        assert!(second_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn tunnels_on_one_connection_share_correlation_namespace() {
+        let stream_state = Arc::new(ConnectionStreamState::new());
+
+        assert_eq!(stream_state.next_correlation_id(), 1);
+        assert_eq!(stream_state.next_correlation_id(), 2);
+    }
+
+    use crate::config::Config;
+    use crate::tunnel_manager::ServerState;
+
+    fn tcp_config(port: u16) -> Config {
+        let mut config = Config::default();
+        config.server.tcp_port_range = [port, port.saturating_add(1)];
+        config
+    }
+
+    async fn request_tcp(state: &Arc<ServerState>, id: &str, port: Option<u16>) -> ServerMsg {
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let stream_state = Arc::new(ConnectionStreamState::new());
+        let mut registered_subdomains = Vec::new();
+        let mut registered_tcp_ports = Vec::new();
+        handle_control_msg(
+            ClientMsg::TunnelRequest {
+                id: id.to_string(),
+                tunnel_type: TunnelType::Tcp { remote_port: port },
+                subdomain: None,
+                basic_auth: None,
+                options: TunnelOptions::default(),
+            },
+            state,
+            &control_tx,
+            &stream_state,
+            &mut registered_subdomains,
+            &mut registered_tcp_ports,
+        )
+        .await;
+        control_rx.recv().await.expect("TCP request response")
+    }
+
+    async fn remove_tcp_and_wait(state: &ServerState, port: u16) {
+        let tunnel = state
+            .remove_tcp_tunnel(port)
+            .expect("TCP tunnel should be registered");
+        let listener_stopped = tunnel.listener_stopped.lock().await.take();
+        if let Some(listener_stopped) = listener_stopped {
+            tokio::time::timeout(Duration::from_secs(1), listener_stopped)
+                .await
+                .expect("TCP listener should stop")
+                .expect("TCP listener completion signal");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_tcp_port_is_rejected_without_overwrite() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(port < u16::MAX);
+        let state = Arc::new(ServerState::new(tcp_config(port)));
+
+        assert!(matches!(
+            request_tcp(&state, "first", Some(port)).await,
+            ServerMsg::TunnelAck { .. }
+        ));
+        let second = request_tcp(&state, "second", Some(port)).await;
+        assert!(matches!(second, ServerMsg::Error { code: 409, .. }));
+        assert_eq!(state.tcp_tunnels.get(&port).unwrap().id, "first");
+
+        remove_tcp_and_wait(&state, port).await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_bind_failure_is_reported_and_reservation_released() {
+        let held = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(port < u16::MAX);
+        let state = Arc::new(ServerState::new(tcp_config(port)));
+
+        let response = request_tcp(&state, "bind-failure", Some(port)).await;
+        match response {
+            ServerMsg::Error { code, message } => {
+                assert_eq!(code, 500);
+                assert!(message.contains("failed to bind TCP port"));
+            }
+            other => panic!("expected bind error, got {other:?}"),
+        }
+        assert!(state.tcp_tunnels.is_empty());
+
+        drop(held);
+        assert!(matches!(
+            request_tcp(&state, "after-bind-failure", Some(port)).await,
+            ServerMsg::TunnelAck { .. }
+        ));
+        remove_tcp_and_wait(&state, port).await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_disconnect_cancels_listener_and_reuses_port() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(port < u16::MAX);
+        let state = Arc::new(ServerState::new(tcp_config(port)));
+
+        assert!(matches!(
+            request_tcp(&state, "disconnect", Some(port)).await,
+            ServerMsg::TunnelAck { .. }
+        ));
+        remove_tcp_and_wait(&state, port).await;
+
+        // The old accept loop has stopped and dropped its socket, so the same
+        // explicit port can be bound and acknowledged immediately.
+        assert!(matches!(
+            request_tcp(&state, "reuse", Some(port)).await,
+            ServerMsg::TunnelAck { .. }
+        ));
+        remove_tcp_and_wait(&state, port).await;
+    }
+
+    #[tokio::test]
+    async fn random_tcp_ack_reports_the_assigned_port() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(port < u16::MAX);
+        let state = Arc::new(ServerState::new(tcp_config(port)));
+
+        let response = request_tcp(&state, "random", None).await;
+        assert!(matches!(
+            response,
+            ServerMsg::TunnelAck {
+                tunnel_type: TunnelType::Tcp {
+                    remote_port: Some(assigned)
+                },
+                ..
+            } if assigned == port
+        ));
+        remove_tcp_and_wait(&state, port).await;
     }
 }

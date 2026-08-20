@@ -2,7 +2,9 @@
 name = "rgrok-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+license-file.workspace = true
 description = "rgrok tunnel server daemon"
 
 [[bin]]
@@ -37,6 +39,7 @@ tokio-rustls = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
@@ -44,6 +47,7 @@ dashmap = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 bcrypt = { workspace = true }
+sha2 = "0.10"
 base64 = { workspace = true }
 pin-project-lite = { workspace = true }
 toml = "1"
@@ -51,3 +55,4 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 prometheus = { workspace = true }
 x509-parser = { workspace = true }
+subtle = { workspace = true }

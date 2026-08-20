@@ -8,6 +8,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+permissions:
+  contents: read
+
 jobs:
   changes:
     name: Detect changes
@@ -16,6 +19,8 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -24,6 +29,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deploy/Dockerfile'
 
   check:
     name: Check
@@ -32,17 +38,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
-  check-skip:
-    name: Check
+  metadata:
+    name: Metadata
     needs: changes
-    if: needs.changes.outputs.rust != 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "No Rust changes, skipping"
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify MSRV and Docker builder stay aligned
+        shell: bash
+        run: |
+          msrv="$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[].rust_version]
+            | unique
+            | if length == 1 and .[0] != null
+              then .[0]
+              else error("all workspace packages must share one rust-version")
+              end
+          ')"
+          grep -Fx "FROM rust:${msrv}-bookworm AS builder" deploy/Dockerfile
 
   test:
     name: Test
@@ -51,17 +74,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
-
-  test-skip:
-    name: Test
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
 
   clippy:
     name: Clippy
@@ -70,19 +87,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-
-  clippy-skip:
-    name: Clippy
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
 
   fmt:
     name: Formatting
@@ -91,18 +102,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  fmt-skip:
-    name: Formatting
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
+  license:
+    name: License metadata
     runs-on: ubuntu-latest
     steps:
-      - run: echo "No Rust changes, skipping"
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify AGPL metadata and package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s LICENSE
+          grep -q '^[[:space:]]*GNU AFFERO GENERAL PUBLIC LICENSE[[:space:]]*$' LICENSE
+          grep -q '^[[:space:]]*Version 3, 19 November 2007[[:space:]]*$' LICENSE
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].license] | unique | join("\n")')" = "AGPL-3.0-only"
+          for package in rgrok-proto rgrok-server rgrok-client; do
+            cargo package --package "$package" --allow-dirty --no-verify --list | grep -qx 'LICENSE'
+          done
 
   pr-title:
     name: PR Title
@@ -127,3 +152,42 @@ jobs:
           subjectPattern: ^.+$
           subjectPatternError: |
             PR title must follow conventional commits format (e.g. "feat: add feature").
+
+  ci-result:
+    name: CI Result
+    needs:
+      - changes
+      - check
+      - metadata
+      - test
+      - clippy
+      - fmt
+      - license
+      - pr-title
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        shell: bash
+        env:
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          METADATA_RESULT: ${{ needs.metadata.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+          LICENSE_RESULT: ${{ needs.license.result }}
+          PR_TITLE_RESULT: ${{ needs.pr-title.result }}
+        run: |
+          set -euo pipefail
+
+          for result in "$CHANGES_RESULT" "$LICENSE_RESULT" "$PR_TITLE_RESULT"; do
+            test "$result" = "success"
+          done
+
+          if [[ "$RUST_CHANGED" == "true" ]]; then
+            for result in "$CHECK_RESULT" "$METADATA_RESULT" "$TEST_RESULT" "$CLIPPY_RESULT" "$FMT_RESULT"; do
+              test "$result" = "success"
+            done
+          fi

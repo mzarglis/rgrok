@@ -17,6 +17,12 @@ pub struct ServerSection {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Use an unencrypted WebSocket control connection.
+    ///
+    /// This is intended for local development only. Production connections
+    /// use `wss://` by default so the auth token is not sent in plaintext.
+    #[serde(default)]
+    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +31,7 @@ pub struct AuthSection {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsSection {
     #[serde(default = "default_inspect_port")]
     pub inspect_port: u16,
@@ -33,6 +39,16 @@ pub struct DefaultsSection {
     pub inspect: bool,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+impl Default for DefaultsSection {
+    fn default() -> Self {
+        Self {
+            inspect_port: default_inspect_port(),
+            inspect: default_inspect(),
+            max_body_bytes: default_max_body_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +134,7 @@ impl Default for ClientConfig {
             server: ServerSection {
                 host: "tunnel.example.com".to_string(),
                 port: default_port(),
+                insecure: false,
             },
             auth: AuthSection {
                 token: String::new(),
@@ -149,12 +166,25 @@ mod tests {
         assert_eq!(config.server.host, "tunnel.example.com");
         assert_eq!(config.server.port, 7835);
         assert_eq!(config.auth.token, "");
-        // DefaultsSection derives Default, so Rust defaults (0/false) apply,
-        // not the serde default functions. The serde defaults only kick in
-        // when deserializing from TOML with missing fields.
-        assert_eq!(config.defaults.inspect_port, 0);
-        assert!(!config.defaults.inspect);
-        assert_eq!(config.defaults.max_body_bytes, 0);
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.format, "pretty");
+    }
+
+    #[test]
+    fn test_missing_config_file_uses_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("rgrok-client-config-{}.toml", uuid::Uuid::new_v4()));
+        let config = ClientConfig::load(&path).expect("load missing config");
+
+        assert_eq!(config.server.host, "tunnel.example.com");
+        assert_eq!(config.server.port, 7835);
+        assert!(config.auth.token.is_empty());
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "pretty");
     }
@@ -165,6 +195,7 @@ mod tests {
             server: ServerSection {
                 host: "my.server.io".to_string(),
                 port: 9999,
+                insecure: false,
             },
             auth: AuthSection {
                 token: "tok_abc123".to_string(),
@@ -185,6 +216,7 @@ mod tests {
 
         assert_eq!(deserialized.server.host, "my.server.io");
         assert_eq!(deserialized.server.port, 9999);
+        assert!(!deserialized.server.insecure);
         assert_eq!(deserialized.auth.token, "tok_abc123");
         assert_eq!(deserialized.defaults.inspect_port, 5050);
         assert!(!deserialized.defaults.inspect);
@@ -207,15 +239,33 @@ token = ""
         assert_eq!(config.server.host, "partial.example.com");
         // port should fall back to default
         assert_eq!(config.server.port, 7835);
-        // defaults section is missing from TOML, so serde uses
-        // DefaultsSection's derive(Default) (Rust Default: 0/false),
-        // NOT the per-field serde default functions.
-        assert_eq!(config.defaults.inspect_port, 0);
-        assert!(!config.defaults.inspect);
-        assert_eq!(config.defaults.max_body_bytes, 0);
+        assert!(!config.server.insecure);
+        // The defaults section is missing from TOML, so serde uses
+        // DefaultsSection::default(), which matches its field defaults.
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
         // logging section should be fully defaulted
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "pretty");
+    }
+
+    #[test]
+    fn test_config_empty_defaults_section_uses_field_defaults() {
+        let toml_str = r#"
+[server]
+host = "empty-defaults.example.com"
+
+[auth]
+token = ""
+
+[defaults]
+"#;
+        let config: ClientConfig = toml::from_str(toml_str).expect("deserialize empty defaults");
+
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
     }
 
     #[test]
@@ -224,6 +274,7 @@ token = ""
 [server]
 host = "custom.host.dev"
 port = 1234
+insecure = true
 
 [auth]
 token = "secret-token"
@@ -241,42 +292,12 @@ format = "compact"
 
         assert_eq!(config.server.host, "custom.host.dev");
         assert_eq!(config.server.port, 1234);
+        assert!(config.server.insecure);
         assert_eq!(config.auth.token, "secret-token");
         assert_eq!(config.defaults.inspect_port, 8080);
         assert!(!config.defaults.inspect);
         assert_eq!(config.defaults.max_body_bytes, 512);
         assert_eq!(config.logging.level, "trace");
         assert_eq!(config.logging.format, "compact");
-    }
-
-    // Auth parsing tests — replicate the logic from main.rs's parse_auth_arg
-    // since that function is not public/importable from here.
-    fn parse_auth(auth: &str) -> Option<(String, String)> {
-        let (user, pass) = auth.split_once(':')?;
-        Some((user.to_string(), pass.to_string()))
-    }
-
-    #[test]
-    fn test_parse_auth_valid() {
-        let result = parse_auth("user:pass");
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_parse_auth_no_colon() {
-        let result = parse_auth("nocolon");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_auth_empty_password() {
-        let result = parse_auth("user:");
-        assert_eq!(result, Some(("user".to_string(), "".to_string())));
-    }
-
-    #[test]
-    fn test_parse_auth_multiple_colons() {
-        let result = parse_auth("user:pass:extra");
-        assert_eq!(result, Some(("user".to_string(), "pass:extra".to_string())));
     }
 }
