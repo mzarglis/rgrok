@@ -203,7 +203,7 @@ async fn clear_requests(State(state): State<Arc<ServerState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn replay_request(
+pub(crate) async fn replay_request(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -225,48 +225,20 @@ async fn replay_request(
         None => return Err(StatusCode::NOT_FOUND),
     };
 
-    // Look up the tunnel session to find the local port target
-    // For server-side replay, we forward through the tunnel to the client's local service
-    let session = match tunnel_subdomain
-        .as_deref()
-        .and_then(|sub| state.tunnels.get(sub))
-    {
-        Some(s) => s.clone(),
-        None => return Err(StatusCode::BAD_GATEWAY),
-    };
+    let subdomain = tunnel_subdomain.ok_or(StatusCode::BAD_GATEWAY)?;
+    let new_id = uuid::Uuid::new_v4().to_string();
 
-    // Re-issue the HTTP request through the tunnel by sending a StreamOpen
-    // For simplicity, we record the replay intent and return success
-    // The actual replay goes through the normal proxy path
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://{}.{}{}",
-        session.subdomain, state.config.server.domain, cap.req_url
-    );
-    let method: reqwest::Method = cap.req_method.parse().unwrap_or(reqwest::Method::GET);
-    let mut req = client.request(method, &url);
+    // Route directly through the normal tunnel stream path. This avoids public DNS/TLS recursion
+    // and stores the completed response under the exact ID returned to the UI.
+    crate::proxy::replay_http_request(state, &subdomain, &cap, new_id.clone())
+        .await
+        .inspect_err(|&status| {
+            tracing::warn!(%status, "Replay failed through tunnel");
+        })?;
 
-    for (k, v) in rgrok_proto::inspect::sanitize_headers(&cap.req_headers) {
-        if !k.eq_ignore_ascii_case("host") {
-            req = req.header(k, v);
-        }
-    }
-    if let Some(body) = &cap.req_body {
-        req = req.body(body.clone());
-    }
-
-    match req.send().await {
-        Ok(_resp) => {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            Ok(Json(ReplayResult {
-                new_request_id: new_id,
-            }))
-        }
-        Err(e) => {
-            tracing::warn!("Replay failed: {}", e);
-            Err(StatusCode::BAD_GATEWAY)
-        }
-    }
+    Ok(Json(ReplayResult {
+        new_request_id: new_id,
+    }))
 }
 
 async fn event_stream(

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Uri};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, HOST};
@@ -21,6 +22,7 @@ use crate::tunnel_manager::{ServerState, TunnelSession};
 const MAX_RESPONSE_HEADERS: usize = 65_536;
 const READ_BUFFER_SIZE: usize = 8_192;
 const CLOSE_DELIMITED_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_INSPECTION_BODY: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyReadError {
@@ -54,6 +56,12 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "upgrade",
 ];
 
+struct PreparedRequest {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+}
 /// Serve the public HTTP proxy that routes requests to tunnels (port 80)
 /// All HTTP requests get a 301 redirect to HTTPS with HSTS.
 pub async fn serve_http(state: Arc<ServerState>) -> anyhow::Result<()> {
@@ -246,7 +254,6 @@ async fn proxy_http_request(
     // Hyper has decoded the public framing. Bound collection before opening a
     // tunnel stream so a slow/oversized upload cannot occupy client capacity.
     let (parts, body) = req.into_parts();
-    let method_str_for_metrics = parts.method.to_string();
     let body_bytes = match collect_body_limited(body, max_request_body_bytes).await {
         Ok(body_bytes) => body_bytes,
         Err(BodyReadError::TooLarge) => {
@@ -262,53 +269,169 @@ async fn proxy_http_request(
             ));
         }
     };
-
-    // Request a proxy stream from the client
-    let mut proxy_stream = match request_proxy_stream(&tunnel).await {
-        Some(s) => s,
-        None => {
-            return Ok(error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "Tunnel client did not respond",
-            ));
-        }
+    let request = PreparedRequest {
+        method: parts.method,
+        uri: parts.uri,
+        headers: parts.headers,
+        body: body_bytes,
     };
 
-    let start = std::time::Instant::now();
-    let inspect = tunnel.options.inspect;
-    // captured after parts destructure
+    match proxy_request_to_tunnel(request, state, subdomain, tunnel, None).await {
+        Ok(response) => Ok(response),
+        Err(status) => Ok(error_response(status, "Tunnel proxy request failed")),
+    }
+}
 
-    // Capture request metadata if inspection is enabled
-    let capture_id = if inspect {
-        let req_headers: Vec<(String, String)> = rgrok_proto::inspect::sanitize_headers(
-            &parts
-                .headers
-                .iter()
-                .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.to_string(), vs.to_string())))
-                .collect::<Vec<_>>(),
+/// Replay a captured request through an already-connected tunnel.
+///
+/// The request is routed directly by subdomain so inspection replay never depends on public DNS,
+/// TLS certificates, or a second trip through the public proxy listener.
+pub(crate) async fn replay_http_request(
+    state: Arc<ServerState>,
+    subdomain: &str,
+    capture: &rgrok_proto::inspect::CapturedRequest,
+    request_id: String,
+) -> Result<Response<Full<Bytes>>, StatusCode> {
+    let tunnel = state
+        .tunnels
+        .get(subdomain)
+        .map(|entry| entry.clone())
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+
+    let method =
+        Method::from_bytes(capture.req_method.as_bytes()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let uri = capture
+        .req_url
+        .parse::<Uri>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let body = capture.req_body.clone().unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    let mut had_content_length = false;
+    for (name, value) in &capture.req_headers {
+        if !is_safe_replay_header(name) {
+            continue;
+        }
+        let header_name = name
+            .parse::<http::header::HeaderName>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let header_value = HeaderValue::from_str(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if header_name == CONTENT_LENGTH {
+            had_content_length = true;
+            continue;
+        }
+        headers.append(header_name, header_value);
+    }
+    // The captured request body may be bounded, so its wire length must match the replay body.
+    // This also prevents a stale Content-Length from causing the local server to wait forever.
+    if had_content_length || !body.is_empty() {
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string()).map_err(|_| StatusCode::BAD_REQUEST)?,
         );
-        let capture = rgrok_proto::inspect::CapturedRequest {
-            id: uuid::Uuid::new_v4().to_string(),
-            captured_at: chrono::Utc::now(),
-            duration_ms: None,
-            tunnel_id: tunnel.id.clone(),
-            req_method: parts.method.to_string(),
-            req_url: parts
-                .uri
-                .path_and_query()
-                .map(|pq| pq.to_string())
-                .unwrap_or_else(|| "/".to_string()),
-            req_headers,
-            req_body: None, // filled after body is read
-            resp_status: None,
-            resp_headers: None,
-            resp_body: None,
-            resp_body_truncated: false,
-            remote_addr: String::new(),
-            tls_version: None,
-        };
-        let id = capture.id.clone();
-        state.store_capture(&subdomain, capture).await;
+    }
+
+    let request = PreparedRequest {
+        method,
+        uri,
+        headers,
+        body,
+    };
+
+    proxy_request_to_tunnel(
+        request,
+        state,
+        subdomain.to_string(),
+        tunnel,
+        Some(request_id),
+    )
+    .await
+}
+
+fn is_safe_replay_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-access-token"
+    )
+}
+
+async fn proxy_request_to_tunnel(
+    request: PreparedRequest,
+    state: Arc<ServerState>,
+    subdomain: String,
+    tunnel: Arc<TunnelSession>,
+    capture_id: Option<String>,
+) -> Result<Response<Full<Bytes>>, StatusCode> {
+    let mut proxy_stream = request_proxy_stream(&tunnel)
+        .await
+        .ok_or(StatusCode::GATEWAY_TIMEOUT)?;
+    let start = std::time::Instant::now();
+    let method_str_for_metrics = request.method.to_string();
+    let inspect = tunnel.options.inspect || capture_id.is_some();
+
+    let req_headers: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect();
+    let req_body = if request.body.is_empty() {
+        None
+    } else {
+        Some(Bytes::copy_from_slice(
+            &request.body[..request.body.len().min(MAX_INSPECTION_BODY)],
+        ))
+    };
+    let capture_id = if inspect {
+        let is_replay = capture_id.is_some();
+        let id = capture_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        state
+            .store_capture(
+                &subdomain,
+                rgrok_proto::inspect::CapturedRequest {
+                    id: id.clone(),
+                    captured_at: chrono::Utc::now(),
+                    duration_ms: None,
+                    tunnel_id: tunnel.id.clone(),
+                    req_method: request.method.to_string(),
+                    req_url: request
+                        .uri
+                        .path_and_query()
+                        .map(|path| path.to_string())
+                        .unwrap_or_else(|| "/".to_string()),
+                    req_headers,
+                    req_body,
+                    resp_status: None,
+                    resp_headers: None,
+                    resp_body: None,
+                    resp_body_truncated: false,
+                    remote_addr: if is_replay {
+                        "replay".to_string()
+                    } else {
+                        String::new()
+                    },
+                    tls_version: None,
+                },
+            )
+            .await;
         Some(id)
     } else {
         None
@@ -319,8 +442,8 @@ async fn proxy_http_request(
     // decoded body length. Connection tokens name additional hop-by-hop headers and are removed
     // as well (RFC 9110 section 7.6.1).
     let raw_request = serialize_http_request(
-        &parts,
-        body_bytes.len(),
+        &request,
+        request.body.len(),
         tunnel.options.host_header.as_deref(),
     );
 
@@ -330,41 +453,32 @@ async fn proxy_http_request(
         .await
         .is_err()
     {
-        return Ok(error_response(
-            StatusCode::BAD_GATEWAY,
-            "Failed to write to tunnel",
-        ));
+        return Err(StatusCode::BAD_GATEWAY);
     }
 
-    if !body_bytes.is_empty() && proxy_stream.write_all(&body_bytes).await.is_err() {
-        return Ok(error_response(
-            StatusCode::BAD_GATEWAY,
-            "Failed to write body to tunnel",
-        ));
+    if !request.body.is_empty() && proxy_stream.write_all(&request.body).await.is_err() {
+        return Err(StatusCode::BAD_GATEWAY);
     }
 
     // Parse exactly one response. Content-Length and chunked responses complete without waiting
     // for the local TCP connection to close; only a genuinely close-delimited response reads EOF.
     let parsed_response = match read_http_response(
         &mut proxy_stream,
-        &parts.method,
+        &request.method,
         state.config.server.max_response_body_bytes,
     )
     .await
     {
         Ok(response) => response,
         Err(_) => {
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "Invalid or incomplete response from tunnel",
-            ));
+            return Err(StatusCode::BAD_GATEWAY);
         }
     };
     let status_code = parsed_response.status_code;
     let header_str = parsed_response.header_text;
     let body_data = parsed_response.body;
     let response_headers = parsed_response.headers;
-    let response_no_body = response_has_no_body(&parts.method, status_code);
+    let response_no_body = response_has_no_body(&request.method, status_code);
 
     let mut builder = Response::builder().status(status_code);
 
@@ -384,7 +498,7 @@ async fn proxy_http_request(
         }
         builder = builder.header(name.as_str(), value.as_str());
     }
-    if parts.method == Method::HEAD {
+    if request.method == Method::HEAD {
         if let Some(content_length) = source_content_length {
             builder = builder.header("Content-Length", content_length);
         }
@@ -393,8 +507,6 @@ async fn proxy_http_request(
     } else {
         builder = builder.header("Content-Length", body_data.len().to_string());
     }
-
-    // Inject HSTS and any configured response headers
     builder = builder.header("Strict-Transport-Security", "max-age=31536000");
     for (name, value) in &tunnel.options.response_header {
         builder = builder.header(name.as_str(), value.as_str());
@@ -415,15 +527,15 @@ async fn proxy_http_request(
                 .collect::<Vec<_>>(),
         );
 
-        let body_truncated = body_data.len() > 1_048_576;
+        let body_truncated = body_data.len() > MAX_INSPECTION_BODY;
         let captured_body = if body_data.is_empty() {
             None
         } else {
-            let len = body_data.len().min(1_048_576);
-            Some(Bytes::copy_from_slice(&body_data[..len]))
+            Some(Bytes::copy_from_slice(
+                &body_data[..body_data.len().min(MAX_INSPECTION_BODY)],
+            ))
         };
 
-        // Send completion event
         let _ = state
             .inspect_tx
             .send(rgrok_proto::inspect::InspectEvent::RequestCompleted {
@@ -431,8 +543,6 @@ async fn proxy_http_request(
                 duration_ms,
                 resp_status: status_code,
             });
-
-        // Update the capture in the ring buffer (best-effort)
         if let Some(captures) = state.captures.get(&subdomain) {
             let mut queue = captures.lock().await;
             // Find and update the existing capture by walking backwards (most recent first)
@@ -449,7 +559,6 @@ async fn proxy_http_request(
         }
     }
 
-    // Record Prometheus metrics
     let duration_for_metrics = start.elapsed().as_millis() as f64;
     state
         .metrics
@@ -464,16 +573,12 @@ async fn proxy_http_request(
     state
         .metrics
         .bytes_in_total
-        .inc_by((raw_request.len() + body_bytes.len()) as u64);
+        .inc_by(raw_request.len() as u64 + request.body.len() as u64);
     state.metrics.bytes_out_total.inc_by(body_data.len() as u64);
 
-    let response = builder
+    builder
         .body(Full::new(Bytes::from(body_data)))
-        .unwrap_or_else(|_| {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Response build error")
-        });
-
-    Ok(response)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Debug)]
@@ -800,7 +905,7 @@ fn hop_by_hop_header_names<'a>(
 }
 
 fn serialize_http_request(
-    parts: &http::request::Parts,
+    parts: &PreparedRequest,
     body_length: usize,
     custom_host: Option<&str>,
 ) -> String {
@@ -1154,8 +1259,14 @@ mod tests {
             .body(())
             .unwrap();
         let (parts, ()) = request.into_parts();
+        let request = PreparedRequest {
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
+            body: Bytes::new(),
+        };
 
-        let serialized = serialize_http_request(&parts, 11, None);
+        let serialized = serialize_http_request(&request, 11, None);
         assert!(serialized.starts_with("POST /submit HTTP/1.1\r\n"));
         assert!(serialized.contains("Content-Length: 11\r\n"));
         assert!(!serialized.contains("Transfer-Encoding"));

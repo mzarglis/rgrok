@@ -238,9 +238,13 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use rgrok_proto::inspect::CapturedRequest;
     use rgrok_proto::messages::*;
     use rgrok_proto::spawn_yamux_driver;
     use rgrok_proto::transport::{
@@ -753,6 +757,162 @@ mod tests {
             response_data,
             "Response bytes should reach the server"
         );
+    }
+
+    /// Inspection replay must use the original method/query/body, omit unsafe headers, and store
+    /// the actual response under the ID returned by the API.
+    #[tokio::test]
+    async fn test_e2e_inspection_replay_fidelity_and_lookup() {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+
+        let (port, state) = start_test_server().await;
+        let ws = connect_ws(port).await;
+        let ws_compat = WsCompat::new(ws);
+        let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
+        let (control, _rx, _handle) = spawn_yamux_driver(mux);
+        let mut ctrl = control.open_stream().await.unwrap();
+
+        write_msg_to_stream(
+            &mut ctrl,
+            &ClientMsg::Auth {
+                token: test_token(),
+                version: "0.1.0".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: ServerMsg = read_msg_from_stream(&mut ctrl).await.unwrap();
+
+        write_msg_to_stream(
+            &mut ctrl,
+            &ClientMsg::TunnelRequest {
+                id: "replay-tunnel".to_string(),
+                tunnel_type: TunnelType::Http,
+                subdomain: Some("replay".to_string()),
+                basic_auth: None,
+                options: TunnelOptions {
+                    inspect: true,
+                    ..TunnelOptions::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let _: ServerMsg = read_msg_from_stream(&mut ctrl).await.unwrap();
+
+        let original_id = "original-request".to_string();
+        state
+            .store_capture(
+                "replay",
+                CapturedRequest {
+                    id: original_id.clone(),
+                    captured_at: chrono::Utc::now(),
+                    duration_ms: Some(1),
+                    tunnel_id: "replay-tunnel".to_string(),
+                    req_method: "POST".to_string(),
+                    req_url: "/echo?from=replay".to_string(),
+                    req_headers: vec![
+                        ("Host".to_string(), "replay.tunnel.test.local".to_string()),
+                        ("Authorization".to_string(), "Bearer secret".to_string()),
+                        ("Cookie".to_string(), "session=secret".to_string()),
+                        ("Connection".to_string(), "keep-alive".to_string()),
+                        ("Content-Type".to_string(), "text/plain".to_string()),
+                        ("Content-Length".to_string(), "12".to_string()),
+                    ],
+                    req_body: Some(Bytes::from_static(b"hello replay")),
+                    resp_status: Some(200),
+                    resp_headers: None,
+                    resp_body: None,
+                    resp_body_truncated: false,
+                    remote_addr: "127.0.0.1".to_string(),
+                    tls_version: None,
+                },
+            )
+            .await;
+
+        let replay_task = tokio::spawn(web_ui::replay_request(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(original_id),
+        ));
+
+        let open = tokio::time::timeout(Duration::from_secs(5), read_msg_from_stream(&mut ctrl))
+            .await
+            .expect("timed out waiting for replay stream")
+            .unwrap();
+        let correlation_id = match open {
+            ServerMsg::StreamOpen { correlation_id, .. } => correlation_id,
+            other => panic!("Expected replay StreamOpen, got {:?}", other),
+        };
+
+        let mut data_stream = control.open_stream().await.unwrap();
+        data_stream
+            .write_all(&correlation_id.to_be_bytes())
+            .await
+            .unwrap();
+        data_stream.flush().await.unwrap();
+
+        let mut request_data = Vec::new();
+        let mut buf = [0u8; 1024];
+        let body = b"hello replay";
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), data_stream.read(&mut buf))
+                .await
+                .expect("timed out waiting for replay request")
+                .unwrap();
+            assert!(n > 0, "replay stream closed before request arrived");
+            request_data.extend_from_slice(&buf[..n]);
+            if let Some(header_end) = request_data.windows(4).position(|w| w == b"\r\n\r\n") {
+                if request_data.len() >= header_end + 4 + body.len() {
+                    break;
+                }
+            }
+        }
+        let request_text = String::from_utf8_lossy(&request_data);
+        let request_text_lower = request_text.to_ascii_lowercase();
+        assert!(request_text.starts_with("POST /echo?from=replay HTTP/1.1\r\n"));
+        assert!(request_text_lower.contains("content-type: text/plain\r\n"));
+        assert!(request_text_lower.contains("content-length: 12\r\n"));
+        assert!(!request_text_lower.contains("host:"));
+        assert!(!request_text_lower.contains("authorization:"));
+        assert!(!request_text_lower.contains("cookie:"));
+        assert!(!request_text_lower.contains("connection:"));
+        assert!(request_data.ends_with(body));
+
+        data_stream
+            .write_all(b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\ncreated")
+            .await
+            .unwrap();
+        data_stream.flush().await.unwrap();
+        drop(data_stream);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), replay_task)
+            .await
+            .expect("timed out waiting for replay API response")
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let (_parts, response_body) = response.into_parts();
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&response_body.collect().await.unwrap().to_bytes()).unwrap();
+        let new_id = response_json["new_request_id"]
+            .as_str()
+            .expect("replay API should return an ID");
+
+        let captures = state.captures.get("replay").unwrap();
+        let captures = captures.lock().await;
+        let replayed = captures
+            .iter()
+            .find(|capture| capture.id == new_id)
+            .expect("returned ID should resolve to a stored capture");
+        assert_eq!(replayed.req_method, "POST");
+        assert_eq!(replayed.req_url, "/echo?from=replay");
+        assert_eq!(replayed.req_body.as_deref(), Some(body.as_slice()));
+        assert_eq!(replayed.resp_status, Some(201));
+        assert_eq!(replayed.resp_body.as_deref(), Some(b"created".as_slice()));
+        assert!(replayed.req_headers.iter().all(|(name, _)| !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host" | "authorization" | "cookie" | "connection"
+        )));
     }
 
     /// Graceful Shutdown: verify CancellationToken correctly stops listeners, drains active
