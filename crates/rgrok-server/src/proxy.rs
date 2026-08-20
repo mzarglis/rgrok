@@ -548,12 +548,26 @@ async fn request_proxy_stream(
 }
 
 /// Serve TCP tunnels by binding dynamic ports — raw byte bridging (no HTTP parsing)
+#[allow(dead_code)] // Compatibility entry point; production binds before registration.
 pub async fn serve_tcp_tunnel(
     state: Arc<ServerState>,
     port: u16,
     tunnel: Arc<TunnelSession>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    serve_tcp_tunnel_on_listener(state, listener, tunnel).await
+}
+
+/// Serve a TCP tunnel using a listener that was bound before registration.
+///
+/// Keeping the listener outside this function lets control-plane registration
+/// guarantee that a TunnelAck is only sent once the public port is live.
+pub async fn serve_tcp_tunnel_on_listener(
+    state: Arc<ServerState>,
+    listener: TcpListener,
+    tunnel: Arc<TunnelSession>,
+) -> anyhow::Result<()> {
+    let port = listener.local_addr()?.port();
     info!(port, "TCP tunnel listener started");
 
     loop {
@@ -563,16 +577,25 @@ pub async fn serve_tcp_tunnel(
                 info!(port, "TCP tunnel listener shutting down");
                 return Ok(());
             }
+            _ = tunnel.cancel.cancelled() => {
+                info!(port, "TCP tunnel listener cancelled");
+                return Ok(());
+            }
         };
         let tunnel = tunnel.clone();
 
         tokio::spawn(async move {
-            let mut proxy_stream = match request_proxy_stream(&tunnel).await {
-                Some(s) => s,
-                None => return,
-            };
+            tokio::select! {
+                _ = tunnel.cancel.cancelled() => {}
+                result = async {
+                    let mut proxy_stream = match request_proxy_stream(&tunnel).await {
+                        Some(s) => s,
+                        None => return,
+                    };
 
-            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut proxy_stream).await;
+                    let _ = tokio::io::copy_bidirectional(&mut incoming, &mut proxy_stream).await;
+                } => result,
+            }
         });
     }
 }

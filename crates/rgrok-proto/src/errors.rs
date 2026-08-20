@@ -10,6 +10,12 @@ pub enum TunnelError {
     #[error("no TCP ports available in range {start}-{end}")]
     NoPortsAvailable { start: u16, end: u16 },
 
+    #[error("TCP port {port} is already in use")]
+    TcpPortTaken { port: u16 },
+
+    #[error("TCP port {port} is outside configured range {start}-{end}")]
+    TcpPortOutOfRange { port: u16, start: u16, end: u16 },
+
     #[error("connection to local port {port} refused")]
     LocalPortRefused { port: u16 },
 

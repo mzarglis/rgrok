@@ -1,6 +1,6 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -19,6 +19,12 @@ pub struct ServerState {
     pub tunnels: DashMap<String, Arc<TunnelSession>>,
     /// Map from TCP port -> active tunnel
     pub tcp_tunnels: DashMap<u16, Arc<TunnelSession>>,
+    /// Ports reserved while their listener is being bound and registered.
+    ///
+    /// Binding a socket is asynchronous, so the active-tunnel map alone cannot
+    /// make allocation atomic. This map closes that gap without publishing a
+    /// tunnel until its listener is ready.
+    tcp_port_reservations: StdMutex<HashMap<u16, String>>,
     /// Inspection capture ring-buffer per tunnel (last N requests)
     pub captures: DashMap<String, Arc<Mutex<VecDeque<CapturedRequest>>>>,
     /// Broadcast channel for web UI live updates
@@ -46,6 +52,7 @@ impl ServerState {
             config,
             tunnels: DashMap::new(),
             tcp_tunnels: DashMap::new(),
+            tcp_port_reservations: StdMutex::new(HashMap::new()),
             captures: DashMap::new(),
             inspect_tx,
             cancel: CancellationToken::new(),
@@ -106,20 +113,126 @@ impl ServerState {
     }
 
     /// Allocate a TCP port from the configured range
+    #[allow(dead_code)] // Kept for diagnostics and direct state/unit-test callers.
     pub fn allocate_tcp_port(&self) -> Option<u16> {
         let [start, end] = self.config.server.tcp_port_range;
-        (start..end).find(|&port| !self.tcp_tunnels.contains_key(&port))
+        let reservations = self
+            .tcp_port_reservations
+            .lock()
+            .expect("TCP port reservation mutex poisoned");
+        (start..end).find(|&port| {
+            !self.tcp_tunnels.contains_key(&port) && !reservations.contains_key(&port)
+        })
     }
 
-    /// Register a TCP tunnel on a specific port
-    pub fn register_tcp_tunnel(&self, port: u16, session: Arc<TunnelSession>) {
-        self.tcp_tunnels.insert(port, session);
+    /// Reserve a TCP port before binding its listener.
+    ///
+    /// Both automatic and explicit allocation take the same mutex, so two
+    /// concurrent tunnel requests cannot select the same port.
+    pub fn reserve_tcp_port(
+        &self,
+        requested: Option<u16>,
+        tunnel_id: &str,
+    ) -> Result<u16, rgrok_proto::TunnelError> {
+        let [start, end] = self.config.server.tcp_port_range;
+        let mut reservations = self
+            .tcp_port_reservations
+            .lock()
+            .expect("TCP port reservation mutex poisoned");
+
+        let port = match requested {
+            Some(port) => {
+                if !(start..end).contains(&port) {
+                    return Err(rgrok_proto::TunnelError::TcpPortOutOfRange { port, start, end });
+                }
+                port
+            }
+            None => (start..end)
+                .find(|port| {
+                    !self.tcp_tunnels.contains_key(port) && !reservations.contains_key(port)
+                })
+                .ok_or(rgrok_proto::TunnelError::NoPortsAvailable { start, end })?,
+        };
+
+        if self.tcp_tunnels.contains_key(&port) || reservations.contains_key(&port) {
+            return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
+        }
+
+        reservations.insert(port, tunnel_id.to_string());
+        Ok(port)
+    }
+
+    /// Release a reservation when binding or registration fails.
+    pub fn release_tcp_port_reservation(&self, port: u16, tunnel_id: &str) {
+        let mut reservations = self
+            .tcp_port_reservations
+            .lock()
+            .expect("TCP port reservation mutex poisoned");
+        if reservations
+            .get(&port)
+            .is_some_and(|owner| owner == tunnel_id)
+        {
+            reservations.remove(&port);
+        }
+    }
+
+    /// Register a TCP tunnel on a specific, already-reserved port.
+    pub fn try_register_tcp_tunnel(
+        &self,
+        port: u16,
+        session: Arc<TunnelSession>,
+    ) -> Result<(), rgrok_proto::TunnelError> {
+        let [start, end] = self.config.server.tcp_port_range;
+        if !(start..end).contains(&port) {
+            return Err(rgrok_proto::TunnelError::TcpPortOutOfRange { port, start, end });
+        }
+
+        let mut reservations = self
+            .tcp_port_reservations
+            .lock()
+            .expect("TCP port reservation mutex poisoned");
+        if let Some(owner) = reservations.get(&port) {
+            if owner != &session.id {
+                return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
+            }
+        }
+
+        // Use the entry API so a stale/competing entry can never be silently
+        // overwritten, even if a caller bypasses the reservation helper.
+        use dashmap::mapref::entry::Entry;
+        match self.tcp_tunnels.entry(port) {
+            Entry::Occupied(_) => Err(rgrok_proto::TunnelError::TcpPortTaken { port }),
+            Entry::Vacant(entry) => {
+                entry.insert(session);
+                reservations.remove(&port);
+                Ok(())
+            }
+        }
+    }
+
+    /// Compatibility helper for callers that directly register a free port.
+    /// Production tunnel creation uses `reserve_tcp_port` followed by
+    /// `try_register_tcp_tunnel` so binding and publication are ordered.
+    #[allow(dead_code)] // Kept for diagnostics and direct state/unit-test callers.
+    pub fn register_tcp_tunnel(&self, port: u16, session: Arc<TunnelSession>) -> bool {
+        self.try_register_tcp_tunnel(port, session).is_ok()
     }
 
     /// Unregister a TCP tunnel
+    #[allow(dead_code)] // Kept for direct state/unit-test callers.
     pub fn unregister_tcp_tunnel(&self, port: u16) {
-        self.tcp_tunnels.remove(&port);
-        self.cleanup_notify.notify_waiters();
+        let _ = self.remove_tcp_tunnel(port);
+    }
+
+    /// Remove a TCP tunnel and cancel its listener. The removed session is
+    /// returned so async cleanup can wait for the listener socket to close.
+    pub fn remove_tcp_tunnel(&self, port: u16) -> Option<Arc<TunnelSession>> {
+        let removed = self.tcp_tunnels.remove(&port).map(|(_, tunnel)| tunnel);
+        if let Some(tunnel) = &removed {
+            tunnel.cancel.cancel();
+            self.cleanup_notify.notify_waiters();
+        }
+        removed
     }
 
     /// Store a captured request for inspection
@@ -178,6 +291,10 @@ pub struct TunnelSession {
     pub stream_state: Arc<ConnectionStreamState>,
     /// Cached last successful Authorization header value (fast-path to skip bcrypt)
     pub cached_auth_header: Mutex<Option<String>>,
+    /// Cancellation for resources owned by this tunnel (notably TCP listener).
+    pub cancel: CancellationToken,
+    /// One-shot completion signal for the TCP listener task, if this is a TCP tunnel.
+    pub listener_stopped: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl TunnelSession {
@@ -230,6 +347,8 @@ mod tests {
             control_tx: tx,
             stream_state: Arc::new(ConnectionStreamState::new()),
             cached_auth_header: Mutex::new(None),
+            cancel: CancellationToken::new(),
+            listener_stopped: Mutex::new(None),
         })
     }
 
