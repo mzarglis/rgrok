@@ -44,14 +44,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
-  check-skip:
-    name: Check
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
-
   metadata:
     name: Metadata
     needs: changes
@@ -88,14 +80,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
 
-  test-skip:
-    name: Test
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
-
   clippy:
     name: Clippy
     needs: changes
@@ -111,14 +95,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
-  clippy-skip:
-    name: Clippy
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
-
   fmt:
     name: Formatting
     needs: changes
@@ -132,14 +108,6 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-
-  fmt-skip:
-    name: Formatting
-    needs: changes
-    if: needs.changes.outputs.rust != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No Rust changes, skipping"
 
   license:
     name: License metadata
@@ -184,3 +152,42 @@ jobs:
           subjectPattern: ^.+$
           subjectPatternError: |
             PR title must follow conventional commits format (e.g. "feat: add feature").
+
+  ci-result:
+    name: CI Result
+    needs:
+      - changes
+      - check
+      - metadata
+      - test
+      - clippy
+      - fmt
+      - license
+      - pr-title
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        shell: bash
+        env:
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          METADATA_RESULT: ${{ needs.metadata.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+          LICENSE_RESULT: ${{ needs.license.result }}
+          PR_TITLE_RESULT: ${{ needs.pr-title.result }}
+        run: |
+          set -euo pipefail
+
+          for result in "$CHANGES_RESULT" "$LICENSE_RESULT" "$PR_TITLE_RESULT"; do
+            test "$result" = "success"
+          done
+
+          if [[ "$RUST_CHANGED" == "true" ]]; then
+            for result in "$CHECK_RESULT" "$METADATA_RESULT" "$TEST_RESULT" "$CLIPPY_RESULT" "$FMT_RESULT"; do
+              test "$result" = "success"
+            done
+          fi
