@@ -16,6 +16,9 @@ pub enum TunnelError {
     #[error("TCP port {port} is outside configured range {start}-{end}")]
     TcpPortOutOfRange { port: u16, start: u16, end: u16 },
 
+    #[error("tunnel capacity exhausted (maximum {max})")]
+    CapacityExceeded { max: usize },
+
     #[error("connection to local port {port} refused")]
     LocalPortRefused { port: u16 },
 

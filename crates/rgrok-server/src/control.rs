@@ -182,8 +182,8 @@ where
     let stream_state = Arc::new(ConnectionStreamState::new());
 
     // Track resources for cleanup
-    let mut registered_subdomains: Vec<String> = Vec::new();
-    let mut registered_tcp_ports: Vec<u16> = Vec::new();
+    let mut registered_subdomains: Vec<(String, Arc<TunnelSession>)> = Vec::new();
+    let mut registered_tcp_ports: Vec<(u16, Arc<TunnelSession>)> = Vec::new();
 
     // Spawn task to accept proxy data streams from client
     let accept_stream_state = stream_state.clone();
@@ -224,15 +224,27 @@ where
 
     // Cleanup
     info!(session_id = %session_id, "Client disconnected, cleaning up tunnels");
-    for subdomain in &registered_subdomains {
-        state.unregister_tunnel(subdomain);
+    for (subdomain, session) in &registered_subdomains {
+        state.unregister_tunnel_if_owner(subdomain, session);
     }
-    for port in &registered_tcp_ports {
-        if let Some(tunnel) = state.remove_tcp_tunnel(*port) {
+    for (port, expected) in &registered_tcp_ports {
+        if let Some(tunnel) = state.remove_tcp_tunnel_if_owner(*port, expected) {
             // Cancellation closes the accept loop. Wait for the listener task
             // to drop its socket before allowing this port to be reused.
-            if let Some(listener_stopped) = tunnel.listener_stopped.lock().await.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), listener_stopped).await;
+            let listener_stopped = match tunnel.listener_stopped.lock().await.take() {
+                Some(listener_stopped) => matches!(
+                    tokio::time::timeout(Duration::from_secs(5), listener_stopped).await,
+                    Ok(Ok(()))
+                ),
+                None => true,
+            };
+            if listener_stopped {
+                state.release_tcp_port_reservation(*port, &tunnel.id);
+            } else {
+                warn!(
+                    port,
+                    "TCP listener did not stop; retaining port reservation"
+                );
             }
         }
     }
@@ -279,8 +291,8 @@ async fn handle_control_msg(
     state: &Arc<ServerState>,
     control_tx: &mpsc::Sender<ServerMsg>,
     stream_state: &Arc<ConnectionStreamState>,
-    registered_subdomains: &mut Vec<String>,
-    registered_tcp_ports: &mut Vec<u16>,
+    registered_subdomains: &mut Vec<(String, Arc<TunnelSession>)>,
+    registered_tcp_ports: &mut Vec<(u16, Arc<TunnelSession>)>,
 ) {
     match msg {
         ClientMsg::TunnelRequest {
@@ -306,23 +318,8 @@ async fn handle_control_msg(
                 None => generate_subdomain(),
             };
 
-            let basic_auth_hash = if let Some(ref ba) = basic_auth {
-                match auth::hash_basic_auth_password(&ba.password) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        let _ = control_tx
-                            .send(ServerMsg::Error {
-                                code: 500,
-                                message: format!("Failed to hash password: {}", e),
-                            })
-                            .await;
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
+            // Reserve the name or port before any potentially slow setup so
+            // in-flight requests consume capacity just like active tunnels.
             let tcp_port = match &tunnel_type {
                 TunnelType::Tcp { remote_port } => {
                     let port = match state.reserve_tcp_port(*remote_port, &id) {
@@ -332,6 +329,7 @@ async fn handle_control_msg(
                                 rgrok_proto::TunnelError::TcpPortOutOfRange { .. } => 400,
                                 rgrok_proto::TunnelError::TcpPortTaken { .. } => 409,
                                 rgrok_proto::TunnelError::NoPortsAvailable { .. } => 503,
+                                rgrok_proto::TunnelError::CapacityExceeded { .. } => 503,
                                 _ => 500,
                             };
                             let _ = control_tx
@@ -345,7 +343,45 @@ async fn handle_control_msg(
                     };
                     Some(port)
                 }
-                _ => None,
+                _ => {
+                    if let Err(e) = state.reserve_http_tunnel(&assigned_subdomain, &id) {
+                        let code = match &e {
+                            rgrok_proto::TunnelError::CapacityExceeded { .. } => 503,
+                            rgrok_proto::TunnelError::SubdomainTaken { .. } => 409,
+                            _ => 500,
+                        };
+                        let _ = control_tx
+                            .send(ServerMsg::Error {
+                                code,
+                                message: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                    None
+                }
+            };
+
+            let basic_auth_hash = if let Some(ref ba) = basic_auth {
+                match auth::hash_basic_auth_password(&ba.password) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        if let Some(port) = tcp_port {
+                            state.release_tcp_port_reservation(port, &id);
+                        } else {
+                            state.release_http_tunnel(&assigned_subdomain, &id);
+                        }
+                        let _ = control_tx
+                            .send(ServerMsg::Error {
+                                code: 500,
+                                message: format!("Failed to hash password: {}", e),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                None
             };
 
             let public_url = match (&tunnel_type, tcp_port) {
@@ -382,6 +418,7 @@ async fn handle_control_msg(
             match &tunnel_type {
                 TunnelType::Http | TunnelType::Https => {
                     if let Err(e) = state.register_tunnel(session.clone()) {
+                        state.release_http_tunnel(&assigned_subdomain, &id);
                         let _ = control_tx
                             .send(ServerMsg::Error {
                                 code: 409,
@@ -390,11 +427,10 @@ async fn handle_control_msg(
                             .await;
                         return;
                     }
-                    registered_subdomains.push(assigned_subdomain.clone());
+                    registered_subdomains.push((assigned_subdomain.clone(), session.clone()));
                 }
                 TunnelType::Tcp { .. } => {
                     let port = tcp_port.expect("TCP port was reserved above");
-
                     // Bind before publishing the tunnel. A failed bind is a
                     // client-visible error and must not result in a TunnelAck.
                     let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
@@ -425,7 +461,7 @@ async fn handle_control_msg(
                             .await;
                         return;
                     }
-                    registered_tcp_ports.push(port);
+                    registered_tcp_ports.push((port, session.clone()));
 
                     let tcp_state = state.clone();
                     let tcp_tunnel = session.clone();

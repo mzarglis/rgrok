@@ -12,6 +12,16 @@ use rgrok_proto::messages::{BasicAuthConfig, ServerMsg, TunnelOptions, TunnelTyp
 
 use crate::config::Config;
 
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum ReservationKey {
+    Http(String),
+    Tcp(u16),
+}
+
+fn max_tunnels_error(max: usize) -> rgrok_proto::TunnelError {
+    rgrok_proto::TunnelError::CapacityExceeded { max }
+}
+
 /// Shared server state accessible from all handlers
 pub struct ServerState {
     pub config: Config,
@@ -19,12 +29,13 @@ pub struct ServerState {
     pub tunnels: DashMap<String, Arc<TunnelSession>>,
     /// Map from TCP port -> active tunnel
     pub tcp_tunnels: DashMap<u16, Arc<TunnelSession>>,
-    /// Ports reserved while their listener is being bound and registered.
+    /// Registration reservations held while a tunnel is being prepared.
     ///
-    /// Binding a socket is asynchronous, so the active-tunnel map alone cannot
-    /// make allocation atomic. This map closes that gap without publishing a
-    /// tunnel until its listener is ready.
-    tcp_port_reservations: StdMutex<HashMap<u16, String>>,
+    /// This mutex covers both tunnel maps' capacity decisions. A reservation
+    /// is made before any asynchronous preparation (for example, password
+    /// hashing or TCP listener setup), so max_tunnels cannot be exceeded by
+    /// concurrent requests.
+    reservations: StdMutex<HashMap<ReservationKey, String>>,
     /// Inspection capture ring-buffer per tunnel (last N requests)
     pub captures: DashMap<String, Arc<Mutex<VecDeque<CapturedRequest>>>>,
     /// Broadcast channel for web UI live updates
@@ -52,7 +63,7 @@ impl ServerState {
             config,
             tunnels: DashMap::new(),
             tcp_tunnels: DashMap::new(),
-            tcp_port_reservations: StdMutex::new(HashMap::new()),
+            reservations: StdMutex::new(HashMap::new()),
             captures: DashMap::new(),
             inspect_tx,
             cancel: CancellationToken::new(),
@@ -82,101 +93,173 @@ impl ServerState {
         &self,
         session: Arc<TunnelSession>,
     ) -> Result<(), rgrok_proto::TunnelError> {
-        if self.tunnels.len() >= self.config.server.max_tunnels {
-            return Err(rgrok_proto::TunnelError::SubdomainTaken {
-                subdomain: "max tunnels reached".to_string(),
-            });
-        }
-
         let subdomain = session.subdomain.clone();
+        let key = ReservationKey::Http(subdomain.clone());
+        let mut reservations = self.lock_reservations();
+
+        let owns_reservation = reservations
+            .get(&key)
+            .is_some_and(|owner| owner == &session.id);
+        if reservations.contains_key(&key) && !owns_reservation {
+            return Err(rgrok_proto::TunnelError::SubdomainTaken { subdomain });
+        }
         if self.tunnels.contains_key(&subdomain) {
             return Err(rgrok_proto::TunnelError::SubdomainTaken { subdomain });
         }
+        if !owns_reservation && self.at_capacity(&reservations) {
+            return Err(max_tunnels_error(self.config.server.max_tunnels));
+        }
 
-        self.tunnels.insert(subdomain.clone(), session);
-        self.metrics.active_tunnels.inc();
-        self.captures.insert(
-            subdomain,
-            Arc::new(Mutex::new(VecDeque::with_capacity(
-                self.config.inspect.buffer_size,
-            ))),
-        );
+        // Entry::Vacant makes this invariant explicit even if a future caller
+        // bypasses the registration gate.
+        use dashmap::mapref::entry::Entry;
+        match self.tunnels.entry(subdomain.clone()) {
+            Entry::Occupied(_) => Err(rgrok_proto::TunnelError::SubdomainTaken { subdomain }),
+            Entry::Vacant(entry) => {
+                entry.insert(session);
+                if owns_reservation {
+                    reservations.remove(&key);
+                }
+                self.metrics.active_tunnels.inc();
+                self.captures.insert(
+                    subdomain,
+                    Arc::new(Mutex::new(VecDeque::with_capacity(
+                        self.config.inspect.buffer_size,
+                    ))),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Reserve an HTTP subdomain before doing asynchronous tunnel setup.
+    pub fn reserve_http_tunnel(
+        &self,
+        subdomain: &str,
+        owner: &str,
+    ) -> Result<(), rgrok_proto::TunnelError> {
+        let key = ReservationKey::Http(subdomain.to_string());
+        let mut reservations = self.lock_reservations();
+        if self.tunnels.contains_key(subdomain) || reservations.contains_key(&key) {
+            return Err(rgrok_proto::TunnelError::SubdomainTaken {
+                subdomain: subdomain.to_string(),
+            });
+        }
+        if self.at_capacity(&reservations) {
+            return Err(max_tunnels_error(self.config.server.max_tunnels));
+        }
+        reservations.insert(key, owner.to_string());
         Ok(())
     }
 
+    /// Release an HTTP reservation after tunnel setup fails.
+    pub fn release_http_tunnel(&self, subdomain: &str, owner: &str) {
+        let mut reservations = self.lock_reservations();
+        let key = ReservationKey::Http(subdomain.to_string());
+        if reservations
+            .get(&key)
+            .is_some_and(|current| current == owner)
+        {
+            reservations.remove(&key);
+        }
+    }
+
     /// Unregister a tunnel by subdomain
+    #[allow(dead_code)]
     pub fn unregister_tunnel(&self, subdomain: &str) {
-        self.tunnels.remove(subdomain);
-        self.captures.remove(subdomain);
-        self.metrics.active_tunnels.dec();
-        self.cleanup_notify.notify_waiters();
+        self.remove_tunnel_if_owner(subdomain, None);
+    }
+
+    /// Unregister an HTTP tunnel only if it is still owned by `session`.
+    ///
+    /// A disconnected older session can otherwise remove a newer tunnel that
+    /// has reused the same name after the old entry was removed.
+    pub fn unregister_tunnel_if_owner(&self, subdomain: &str, session: &Arc<TunnelSession>) {
+        self.remove_tunnel_if_owner(subdomain, Some(session));
+    }
+
+    fn remove_tunnel_if_owner(&self, subdomain: &str, owner: Option<&Arc<TunnelSession>>) -> bool {
+        let _reservations = self.lock_reservations();
+        let current = self
+            .tunnels
+            .get(subdomain)
+            .map(|current| current.value().clone());
+        let should_remove = current
+            .as_ref()
+            .is_some_and(|current| owner.is_none_or(|owner| Arc::ptr_eq(current, owner)));
+        if !should_remove {
+            return false;
+        }
+        let removed = self.tunnels.remove(subdomain).is_some();
+        if removed {
+            self.captures.remove(subdomain);
+            self.metrics.active_tunnels.dec();
+            self.cleanup_notify.notify_waiters();
+        }
+        removed
     }
 
     /// Allocate a TCP port from the configured range
-    #[allow(dead_code)] // Kept for diagnostics and direct state/unit-test callers.
+    #[allow(dead_code)]
     pub fn allocate_tcp_port(&self) -> Option<u16> {
         let [start, end] = self.config.server.tcp_port_range;
-        let reservations = self
-            .tcp_port_reservations
-            .lock()
-            .expect("TCP port reservation mutex poisoned");
+        let reservations = self.lock_reservations();
         (start..end).find(|&port| {
-            !self.tcp_tunnels.contains_key(&port) && !reservations.contains_key(&port)
+            !self.tcp_tunnels.contains_key(&port)
+                && !reservations.contains_key(&ReservationKey::Tcp(port))
         })
     }
 
-    /// Reserve a TCP port before binding its listener.
-    ///
-    /// Both automatic and explicit allocation take the same mutex, so two
-    /// concurrent tunnel requests cannot select the same port.
+    /// Reserve a TCP port and one slot in max_tunnels atomically.
     pub fn reserve_tcp_port(
         &self,
         requested: Option<u16>,
-        tunnel_id: &str,
+        owner: &str,
     ) -> Result<u16, rgrok_proto::TunnelError> {
         let [start, end] = self.config.server.tcp_port_range;
-        let mut reservations = self
-            .tcp_port_reservations
-            .lock()
-            .expect("TCP port reservation mutex poisoned");
-
+        let mut reservations = self.lock_reservations();
         let port = match requested {
-            Some(port) => {
-                if !(start..end).contains(&port) {
-                    return Err(rgrok_proto::TunnelError::TcpPortOutOfRange { port, start, end });
-                }
-                port
+            Some(port) if !(start..end).contains(&port) => {
+                return Err(rgrok_proto::TunnelError::TcpPortOutOfRange { port, start, end });
             }
+            Some(port) => port,
             None => (start..end)
                 .find(|port| {
-                    !self.tcp_tunnels.contains_key(port) && !reservations.contains_key(port)
+                    !self.tcp_tunnels.contains_key(port)
+                        && !reservations.contains_key(&ReservationKey::Tcp(*port))
                 })
                 .ok_or(rgrok_proto::TunnelError::NoPortsAvailable { start, end })?,
         };
-
-        if self.tcp_tunnels.contains_key(&port) || reservations.contains_key(&port) {
+        let key = ReservationKey::Tcp(port);
+        if self.tcp_tunnels.contains_key(&port) || reservations.contains_key(&key) {
             return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
         }
-
-        reservations.insert(port, tunnel_id.to_string());
+        if self.at_capacity(&reservations) {
+            return Err(max_tunnels_error(self.config.server.max_tunnels));
+        }
+        reservations.insert(key, owner.to_string());
         Ok(port)
     }
 
-    /// Release a reservation when binding or registration fails.
-    pub fn release_tcp_port_reservation(&self, port: u16, tunnel_id: &str) {
-        let mut reservations = self
-            .tcp_port_reservations
-            .lock()
-            .expect("TCP port reservation mutex poisoned");
+    /// Release a TCP port reservation after setup fails.
+    pub fn release_tcp_port_reservation(&self, port: u16, owner: &str) {
+        let mut reservations = self.lock_reservations();
+        let key = ReservationKey::Tcp(port);
         if reservations
-            .get(&port)
-            .is_some_and(|owner| owner == tunnel_id)
+            .get(&key)
+            .is_some_and(|current| current == owner)
         {
-            reservations.remove(&port);
+            reservations.remove(&key);
         }
     }
 
-    /// Register a TCP tunnel on a specific, already-reserved port.
+    /// Register a TCP tunnel on a specific port
+    #[allow(dead_code)] // Kept for direct state/test callers; production binds before publish.
+    pub fn register_tcp_tunnel(&self, port: u16, session: Arc<TunnelSession>) -> bool {
+        self.try_register_tcp_tunnel(port, session).is_ok()
+    }
+
+    /// Publish a TCP tunnel, consuming its reservation when present.
     pub fn try_register_tcp_tunnel(
         &self,
         port: u16,
@@ -186,53 +269,95 @@ impl ServerState {
         if !(start..end).contains(&port) {
             return Err(rgrok_proto::TunnelError::TcpPortOutOfRange { port, start, end });
         }
-
-        let mut reservations = self
-            .tcp_port_reservations
-            .lock()
-            .expect("TCP port reservation mutex poisoned");
-        if let Some(owner) = reservations.get(&port) {
-            if owner != &session.id {
-                return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
-            }
+        let mut reservations = self.lock_reservations();
+        let key = ReservationKey::Tcp(port);
+        let owns_reservation = reservations
+            .get(&key)
+            .is_some_and(|owner| owner == &session.id);
+        if reservations.contains_key(&key) && !owns_reservation {
+            return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
         }
-
-        // Use the entry API so a stale/competing entry can never be silently
-        // overwritten, even if a caller bypasses the reservation helper.
+        if self.tcp_tunnels.contains_key(&port) {
+            return Err(rgrok_proto::TunnelError::TcpPortTaken { port });
+        }
+        if !owns_reservation && self.at_capacity(&reservations) {
+            return Err(max_tunnels_error(self.config.server.max_tunnels));
+        }
         use dashmap::mapref::entry::Entry;
         match self.tcp_tunnels.entry(port) {
             Entry::Occupied(_) => Err(rgrok_proto::TunnelError::TcpPortTaken { port }),
             Entry::Vacant(entry) => {
                 entry.insert(session);
-                reservations.remove(&port);
+                if owns_reservation {
+                    reservations.remove(&key);
+                }
+                self.metrics.active_tunnels.inc();
                 Ok(())
             }
         }
     }
 
-    /// Compatibility helper for callers that directly register a free port.
-    /// Production tunnel creation uses `reserve_tcp_port` followed by
-    /// `try_register_tcp_tunnel` so binding and publication are ordered.
-    #[allow(dead_code)] // Kept for diagnostics and direct state/unit-test callers.
-    pub fn register_tcp_tunnel(&self, port: u16, session: Arc<TunnelSession>) -> bool {
-        self.try_register_tcp_tunnel(port, session).is_ok()
-    }
-
     /// Unregister a TCP tunnel
-    #[allow(dead_code)] // Kept for direct state/unit-test callers.
+    #[allow(dead_code)]
     pub fn unregister_tcp_tunnel(&self, port: u16) {
         let _ = self.remove_tcp_tunnel(port);
     }
 
-    /// Remove a TCP tunnel and cancel its listener. The removed session is
-    /// returned so async cleanup can wait for the listener socket to close.
+    /// Remove a TCP tunnel and return its session, if present.
+    #[allow(dead_code)]
     pub fn remove_tcp_tunnel(&self, port: u16) -> Option<Arc<TunnelSession>> {
+        let _reservations = self.lock_reservations();
         let removed = self.tcp_tunnels.remove(&port).map(|(_, tunnel)| tunnel);
         if let Some(tunnel) = &removed {
             tunnel.cancel.cancel();
+            self.metrics.active_tunnels.dec();
             self.cleanup_notify.notify_waiters();
         }
         removed
+    }
+
+    /// Remove a TCP tunnel only if it is still owned by `session`.
+    ///
+    /// The port remains reserved while its listener shuts down. The cleanup
+    /// caller releases that reservation only after observing listener
+    /// completion, preventing a new registration from racing a still-bound
+    /// socket.
+    pub fn remove_tcp_tunnel_if_owner(
+        &self,
+        port: u16,
+        session: &Arc<TunnelSession>,
+    ) -> Option<Arc<TunnelSession>> {
+        let mut reservations = self.lock_reservations();
+        let current = self
+            .tcp_tunnels
+            .get(&port)
+            .map(|current| current.value().clone());
+        let should_remove = current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session));
+        if !should_remove {
+            return None;
+        }
+        if let Some((_, removed)) = self.tcp_tunnels.remove(&port) {
+            reservations.insert(ReservationKey::Tcp(port), removed.id.clone());
+            removed.cancel.cancel();
+            self.metrics.active_tunnels.dec();
+            self.cleanup_notify.notify_waiters();
+            Some(removed)
+        } else {
+            None
+        }
+    }
+
+    fn lock_reservations(&self) -> std::sync::MutexGuard<'_, HashMap<ReservationKey, String>> {
+        self.reservations
+            .lock()
+            .expect("tunnel registration mutex poisoned")
+    }
+
+    fn at_capacity(&self, reservations: &HashMap<ReservationKey, String>) -> bool {
+        self.tunnels.len() + self.tcp_tunnels.len() + reservations.len()
+            >= self.config.server.max_tunnels
     }
 
     /// Store a captured request for inspection
@@ -250,13 +375,10 @@ impl ServerState {
     }
 }
 
-/// Stream correlation state is shared by every tunnel created on the same
-/// authenticated control connection. This keeps the correlation namespace
-/// scoped to that connection rather than to an individual tunnel.
+/// Stream correlation state shared by every tunnel created over one
+/// authenticated control connection.
 pub struct ConnectionStreamState {
-    /// Next correlation ID for a proxy stream on this control connection.
     pub next_correlation_id: AtomicU32,
-    /// Open yamux streams awaiting the client: correlation_id -> stream sender.
     pub pending_streams: DashMap<u32, oneshot::Sender<yamux::Stream>>,
 }
 
@@ -286,14 +408,13 @@ pub struct TunnelSession {
     pub created_at: Instant,
     /// Sink to send messages to the connected client
     pub control_tx: mpsc::Sender<ServerMsg>,
-    /// Stream correlation state shared with the other tunnels on this client
-    /// control connection.
+    /// Connection-scoped stream IDs and pending data streams.
     pub stream_state: Arc<ConnectionStreamState>,
     /// Cached last successful Authorization header value (fast-path to skip bcrypt)
     pub cached_auth_header: Mutex<Option<String>>,
-    /// Cancellation for resources owned by this tunnel (notably TCP listener).
+    /// Cancels the TCP listener owned by this tunnel.
     pub cancel: CancellationToken,
-    /// One-shot completion signal for the TCP listener task, if this is a TCP tunnel.
+    /// Signals that the TCP listener has dropped its bound socket.
     pub listener_stopped: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
@@ -453,12 +574,10 @@ mod tests {
         let result = state.register_tunnel(make_tunnel_session("sub-c"));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        match err {
-            rgrok_proto::TunnelError::SubdomainTaken { subdomain } => {
-                assert_eq!(subdomain, "max tunnels reached");
-            }
-            other => panic!("expected SubdomainTaken error, got: {:?}", other),
-        }
+        assert!(matches!(
+            err,
+            rgrok_proto::TunnelError::CapacityExceeded { max: 2 }
+        ));
     }
 
     #[test]
@@ -470,5 +589,134 @@ mod tests {
         assert_eq!(state.metrics.active_tunnels.get(), 1);
         state.unregister_tunnel("metrics-test");
         assert_eq!(state.metrics.active_tunnels.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_duplicate_http_registration_has_one_winner() {
+        let state = Arc::new(ServerState::new(make_test_config(32)));
+        let contenders = 32;
+        let barrier = Arc::new(tokio::sync::Barrier::new(contenders));
+        let mut tasks = Vec::with_capacity(contenders);
+
+        for i in 0..contenders {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let id = format!("winner-{i}");
+                state
+                    .register_tunnel(make_test_session("same-name", &id))
+                    .is_ok()
+                    .then_some(id)
+            }));
+        }
+
+        let mut winners = Vec::new();
+        for task in tasks {
+            if let Some(id) = task.await.unwrap() {
+                winners.push(id);
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(state.tunnels.len(), 1);
+        assert_eq!(state.tunnels.get("same-name").unwrap().id, winners[0]);
+        assert_eq!(state.metrics.active_tunnels.get(), 1);
+
+        state.unregister_tunnel("same-name");
+        assert_eq!(state.metrics.active_tunnels.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_capacity_reservations_are_atomic_across_http_and_tcp() {
+        let mut config = make_test_config(10);
+        config.server.max_tunnels = 2;
+        config.server.tcp_port_range = [10000, 10020];
+        let state = Arc::new(ServerState::new(config));
+        let contenders = 16;
+        let reserve_barrier = Arc::new(tokio::sync::Barrier::new(contenders));
+        let commit_barrier = Arc::new(tokio::sync::Barrier::new(contenders));
+        let mut tasks = Vec::with_capacity(contenders);
+
+        for i in 0..contenders {
+            let state = state.clone();
+            let reserve_barrier = reserve_barrier.clone();
+            let commit_barrier = commit_barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let owner = format!("reservation-{i}");
+                reserve_barrier.wait().await;
+                let reservation = if i % 2 == 0 {
+                    state
+                        .reserve_http_tunnel(&format!("http-{i}"), &owner)
+                        .map(|_| None)
+                } else {
+                    state
+                        .reserve_tcp_port(Some(10000 + i as u16), &owner)
+                        .map(Some)
+                };
+                let Ok(tcp_port) = reservation else {
+                    commit_barrier.wait().await;
+                    return false;
+                };
+
+                // Keep all successful reservations in flight until every
+                // contender has attempted its reservation.
+                commit_barrier.wait().await;
+                if let Some(port) = tcp_port {
+                    state.register_tcp_tunnel(port, make_test_session(&format!("tcp-{i}"), &owner))
+                } else {
+                    state
+                        .register_tunnel(make_test_session(&format!("http-{i}"), &owner))
+                        .is_ok()
+                }
+            }));
+        }
+
+        let mut committed = 0;
+        for task in tasks {
+            committed += usize::from(task.await.unwrap());
+        }
+        assert_eq!(committed, 2);
+        assert_eq!(state.tunnels.len() + state.tcp_tunnels.len(), 2);
+        assert_eq!(state.metrics.active_tunnels.get(), 2);
+    }
+
+    #[test]
+    fn test_old_owner_cleanup_cannot_remove_replacement() {
+        let state = ServerState::new(make_test_config(10));
+        let old = make_test_session("replacement", "old");
+        state.register_tunnel(old.clone()).unwrap();
+
+        // The old session disconnects, freeing the name. A replacement then
+        // registers before a delayed cleanup callback from the old session.
+        state.unregister_tunnel_if_owner("replacement", &old);
+        let replacement = make_test_session("replacement", "new");
+        state.register_tunnel(replacement.clone()).unwrap();
+        state.unregister_tunnel_if_owner("replacement", &old);
+
+        {
+            let current = state.tunnels.get("replacement").unwrap();
+            assert!(Arc::ptr_eq(current.value(), &replacement));
+        }
+        assert_eq!(state.metrics.active_tunnels.get(), 1);
+        state.unregister_tunnel_if_owner("replacement", &replacement);
+        assert_eq!(state.metrics.active_tunnels.get(), 0);
+    }
+
+    fn make_test_session(subdomain: &str, id: &str) -> Arc<TunnelSession> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(TunnelSession {
+            id: id.to_string(),
+            tunnel_type: TunnelType::Http,
+            subdomain: subdomain.to_string(),
+            basic_auth: None,
+            basic_auth_hash: None,
+            options: TunnelOptions::default(),
+            created_at: Instant::now(),
+            control_tx: tx,
+            stream_state: Arc::new(ConnectionStreamState::new()),
+            cached_auth_header: Mutex::new(None),
+            cancel: CancellationToken::new(),
+            listener_stopped: Mutex::new(None),
+        })
     }
 }
