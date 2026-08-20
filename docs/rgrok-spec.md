@@ -592,7 +592,7 @@ async fn proxy_http_request(
 }
 ```
 
-**Note on basic auth performance:** `bcrypt` verification is intentionally slow (~100ms at cost 10). To avoid adding 100ms latency to every proxied request, the `TunnelSession` stores the pre-computed `bcrypt` hash in `basic_auth_hash` at tunnel creation time. The per-request check compares the incoming password against this cached hash using `bcrypt::verify`. For repeated requests from the same client (which sends the same `Authorization` header), we additionally cache the last successful raw header value and skip bcrypt if it matches — this reduces the bcrypt cost to once per unique credential, not once per request.
+**Note on basic auth performance:** `bcrypt` verification is intentionally slow (~100ms at cost 10). To avoid adding 100ms latency to every proxied request, the `TunnelSession` stores the pre-computed `bcrypt` hash in `basic_auth_hash` at tunnel creation time. The per-request check compares the incoming password against this cached hash using `bcrypt::verify`, on Tokio's blocking pool behind a bounded semaphore. For repeated requests from the same client (which sends the same `Authorization` header), we additionally cache a SHA-256 fingerprint of the last successful header and skip bcrypt if it matches — this reduces the bcrypt cost to once per unique credential, not once per request, without retaining the raw credential header.
 
 ### 5.5 TCP Proxy
 
@@ -1212,7 +1212,7 @@ When `--auth user:pass` is passed:
 1. Client includes `BasicAuthConfig { username, password }` in the `TunnelRequest`
 2. Server hashes the password with `bcrypt` cost 10 on receipt and stores the hash in `TunnelSession.basic_auth_hash`
 3. For each incoming HTTP request, the `proxy_http_request` function reads the `Authorization` header (available because `hyper` has already parsed the request) and validates it:
-   - First, check if the raw `Authorization` header matches the last successful value (cached in `TunnelSession` as an atomic string). This fast path avoids bcrypt entirely for repeated requests from the same client.
+   - First, check if a SHA-256 fingerprint of the `Authorization` header matches the last successful value (cached in `TunnelSession`). This fast path avoids bcrypt entirely for repeated requests from the same client without retaining the raw credential header.
    - On cache miss, run `bcrypt::verify` against the stored hash.
 4. If absent or invalid, server returns `401 Unauthorized` with `WWW-Authenticate: Basic realm="rgrok"` — the request never reaches the tunnel client
 5. The plaintext password is never stored on the server; only the bcrypt hash is kept

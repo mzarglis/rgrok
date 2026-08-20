@@ -46,6 +46,7 @@ dashmap = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 bcrypt = { workspace = true }
+sha2 = "0.10"
 base64 = { workspace = true }
 pin-project-lite = { workspace = true }
 toml = "1"

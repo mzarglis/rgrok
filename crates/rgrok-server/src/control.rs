@@ -383,6 +383,9 @@ async fn handle_control_msg(
             } else {
                 None
             };
+            let basic_auth_username = basic_auth.as_ref().map(|ba| ba.username.clone());
+            // The session retains only the username and bcrypt hash.
+            drop(basic_auth);
 
             let public_url = match (&tunnel_type, tcp_port) {
                 (TunnelType::Http, None) | (TunnelType::Https, None) => {
@@ -404,15 +407,15 @@ async fn handle_control_msg(
                 id: id.clone(),
                 tunnel_type: tunnel_type.clone(),
                 subdomain: assigned_subdomain.clone(),
-                basic_auth,
+                basic_auth_username,
                 basic_auth_hash,
                 options,
                 created_at: Instant::now(),
                 control_tx: control_tx.clone(),
                 stream_state: stream_state.clone(),
-                cached_auth_header: tokio::sync::Mutex::new(None),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 listener_stopped: tokio::sync::Mutex::new(None),
+                cached_auth_fingerprint: tokio::sync::Mutex::new(None),
             });
 
             match &tunnel_type {

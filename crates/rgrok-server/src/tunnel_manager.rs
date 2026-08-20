@@ -8,8 +8,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use rgrok_proto::inspect::{CapturedRequest, InspectEvent};
-use rgrok_proto::messages::{BasicAuthConfig, ServerMsg, TunnelOptions, TunnelType};
+use rgrok_proto::messages::{ServerMsg, TunnelOptions, TunnelType};
 
+use crate::auth::BasicAuthVerifier;
 use crate::config::Config;
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -46,6 +47,8 @@ pub struct ServerState {
     pub revoked_jtis: RwLock<HashSet<String>>,
     /// Prometheus metrics
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Bounded bcrypt verifier shared by public HTTP handlers.
+    pub basic_auth_verifier: BasicAuthVerifier,
     /// Hot-reloadable TLS config (watched by proxy listeners)
     pub tls_config: tokio::sync::watch::Sender<Option<Arc<rustls::ServerConfig>>>,
     #[allow(dead_code)]
@@ -69,6 +72,7 @@ impl ServerState {
             cancel: CancellationToken::new(),
             revoked_jtis: RwLock::new(revoked),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            basic_auth_verifier: BasicAuthVerifier::default(),
             tls_config: tls_tx,
             tls_config_rx: tls_rx,
             cleanup_notify: Arc::new(tokio::sync::Notify::new()),
@@ -401,7 +405,8 @@ pub struct TunnelSession {
     #[allow(dead_code)]
     pub tunnel_type: TunnelType,
     pub subdomain: String,
-    pub basic_auth: Option<BasicAuthConfig>,
+    /// Username for basic auth; the plaintext password is never retained.
+    pub basic_auth_username: Option<String>,
     pub basic_auth_hash: Option<String>,
     pub options: TunnelOptions,
     #[allow(dead_code)]
@@ -410,12 +415,13 @@ pub struct TunnelSession {
     pub control_tx: mpsc::Sender<ServerMsg>,
     /// Connection-scoped stream IDs and pending data streams.
     pub stream_state: Arc<ConnectionStreamState>,
-    /// Cached last successful Authorization header value (fast-path to skip bcrypt)
-    pub cached_auth_header: Mutex<Option<String>>,
     /// Cancels the TCP listener owned by this tunnel.
     pub cancel: CancellationToken,
     /// Signals that the TCP listener has dropped its bound socket.
     pub listener_stopped: Mutex<Option<oneshot::Receiver<()>>>,
+    /// Cached fingerprint of the last successful Authorization header
+    /// (fast-path to skip bcrypt without retaining reversible credentials).
+    pub cached_auth_fingerprint: Mutex<Option<[u8; 32]>>,
 }
 
 impl TunnelSession {
@@ -461,15 +467,15 @@ mod tests {
             id: "test-id".to_string(),
             tunnel_type: TunnelType::Http,
             subdomain: subdomain.to_string(),
-            basic_auth: None,
+            basic_auth_username: None,
             basic_auth_hash: None,
             options: TunnelOptions::default(),
             created_at: Instant::now(),
             control_tx: tx,
             stream_state: Arc::new(ConnectionStreamState::new()),
-            cached_auth_header: Mutex::new(None),
             cancel: CancellationToken::new(),
             listener_stopped: Mutex::new(None),
+            cached_auth_fingerprint: Mutex::new(None),
         })
     }
 
@@ -708,13 +714,13 @@ mod tests {
             id: id.to_string(),
             tunnel_type: TunnelType::Http,
             subdomain: subdomain.to_string(),
-            basic_auth: None,
+            basic_auth_username: None,
             basic_auth_hash: None,
             options: TunnelOptions::default(),
             created_at: Instant::now(),
             control_tx: tx,
             stream_state: Arc::new(ConnectionStreamState::new()),
-            cached_auth_header: Mutex::new(None),
+            cached_auth_fingerprint: Mutex::new(None),
             cancel: CancellationToken::new(),
             listener_stopped: Mutex::new(None),
         })

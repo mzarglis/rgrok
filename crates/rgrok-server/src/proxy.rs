@@ -154,30 +154,28 @@ async fn proxy_http_request(
 
     // Basic auth check with fast-path cache: if the Authorization header matches the
     // last successfully verified header, skip the expensive bcrypt verification (~100ms).
-    if let (Some(ba), Some(hash)) = (&tunnel.basic_auth, &tunnel.basic_auth_hash) {
+    if let (Some(username), Some(hash)) = (&tunnel.basic_auth_username, &tunnel.basic_auth_hash) {
         let authorized = match req.headers().get(AUTHORIZATION) {
             Some(auth_val) => {
                 let auth_str = auth_val.to_str().unwrap_or("");
+                let auth_fingerprint = auth::auth_header_fingerprint(auth_str);
 
                 // Fast path: check if this header matches the cached successful value
-                let cached = tunnel.cached_auth_header.lock().await;
-                if cached.as_deref() == Some(auth_str) {
+                let cached = tunnel.cached_auth_fingerprint.lock().await;
+                if cached.as_ref() == Some(&auth_fingerprint) {
                     true
                 } else {
-                    drop(cached); // release lock before slow bcrypt
-                    match auth::parse_basic_auth_header(auth_str) {
-                        Some((user, pass)) => {
-                            if user == ba.username && auth::verify_basic_auth_password(&pass, hash)
-                            {
-                                // Cache the successful header value
-                                *tunnel.cached_auth_header.lock().await =
-                                    Some(auth_str.to_string());
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        None => false,
+                    drop(cached); // release lock before the bounded bcrypt task
+                    if state
+                        .basic_auth_verifier
+                        .verify_header(auth_str, username, hash)
+                        .await
+                    {
+                        // Cache only a one-way fingerprint of the successful header.
+                        *tunnel.cached_auth_fingerprint.lock().await = Some(auth_fingerprint);
+                        true
+                    } else {
+                        false
                     }
                 }
             }

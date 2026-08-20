@@ -1,5 +1,92 @@
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Maximum number of bcrypt verifications that may run concurrently.
+///
+/// bcrypt is deliberately CPU-intensive.  Keeping this limit separate from
+/// Tokio's blocking-pool limit prevents an invalid-credential flood from
+/// filling that pool with work that cannot make progress concurrently anyway.
+pub const BASIC_AUTH_MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+/// Runs password verification on Tokio's blocking pool with bounded
+/// concurrency.
+#[derive(Clone)]
+pub struct BasicAuthVerifier {
+    permits: Arc<Semaphore>,
+}
+
+impl Default for BasicAuthVerifier {
+    fn default() -> Self {
+        Self::new(BASIC_AUTH_MAX_CONCURRENT_VERIFICATIONS)
+    }
+}
+
+impl BasicAuthVerifier {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
+        }
+    }
+
+    async fn acquire_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.ok()
+    }
+
+    /// Verify a Basic authorization header without retaining its decoded
+    /// (plaintext) credentials in the async request task while waiting for a
+    /// permit.
+    pub async fn verify_header(
+        &self,
+        header_value: &str,
+        expected_username: &str,
+        hash: &str,
+    ) -> bool {
+        let permit = match self.acquire_permit().await {
+            Some(permit) => permit,
+            None => return false,
+        };
+
+        // Clone sensitive values only after a permit is available, so an
+        // arbitrarily large waiter queue does not retain credential strings.
+        let header_value = header_value.to_owned();
+        let expected_username = expected_username.to_owned();
+        let hash = hash.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            parse_basic_auth_header(&header_value)
+                .map(|(user, pass)| {
+                    user == expected_username && verify_basic_auth_password(&pass, &hash)
+                })
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    #[cfg(test)]
+    async fn run_blocking_for_test<T, F>(&self, operation: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permit = self.acquire_permit().await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .ok()
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenClaims {
@@ -75,6 +162,11 @@ pub fn verify_basic_auth_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
 }
 
+/// Return a non-reversible cache key for an Authorization header.
+pub fn auth_header_fingerprint(header_value: &str) -> [u8; 32] {
+    Sha256::digest(header_value.as_bytes()).into()
+}
+
 /// Parse a base64-encoded Authorization header value for Basic auth
 pub fn parse_basic_auth_header(header_value: &str) -> Option<(String, String)> {
     use base64::Engine;
@@ -125,6 +217,73 @@ mod tests {
         let hash = hash_basic_auth_password("mypassword").unwrap();
         assert!(verify_basic_auth_password("mypassword", &hash));
         assert!(!verify_basic_auth_password("wrongpassword", &hash));
+    }
+
+    #[tokio::test]
+    async fn test_basic_auth_verifier_checks_header_without_blocking_async_task() {
+        use base64::Engine;
+
+        let verifier = BasicAuthVerifier::new(1);
+        let hash = hash_basic_auth_password("mypassword").unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("admin:mypassword");
+        let header = format!("Basic {encoded}");
+
+        assert!(verifier.verify_header(&header, "admin", &hash).await);
+        assert!(!verifier.verify_header(&header, "other-user", &hash).await);
+
+        let wrong_encoded = base64::engine::general_purpose::STANDARD.encode("admin:wrong");
+        let wrong_header = format!("Basic {wrong_encoded}");
+        assert!(!verifier.verify_header(&wrong_header, "admin", &hash).await);
+    }
+
+    #[tokio::test]
+    async fn test_basic_auth_verifier_limits_concurrent_blocking_work() {
+        let verifier = BasicAuthVerifier::new(1);
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_verifier = verifier.clone();
+        let first = tokio::spawn(async move {
+            first_verifier
+                .run_blocking_for_test(move || {
+                    let _ = first_started_tx.send(());
+                    release_first_rx.blocking_recv().unwrap();
+                    1u8
+                })
+                .await
+        });
+
+        first_started_rx.await.unwrap();
+        assert_eq!(verifier.available_permits(), 0);
+
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second_verifier = verifier.clone();
+        let second = tokio::spawn(async move {
+            second_verifier
+                .run_blocking_for_test(move || {
+                    let _ = second_started_tx.send(());
+                    2u8
+                })
+                .await
+        });
+
+        // The second operation cannot start until the first operation drops
+        // its permit, and therefore remains pending while the first is held.
+        assert_eq!(verifier.available_permits(), 0);
+        release_first_tx.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Some(1));
+        second_started_rx.await.unwrap();
+        assert_eq!(second.await.unwrap(), Some(2));
+        assert_eq!(verifier.available_permits(), 1);
+    }
+
+    #[test]
+    fn test_auth_header_fingerprint_is_stable_without_retaining_header() {
+        let first = auth_header_fingerprint("Basic YWRtaW46cGFzcw==");
+        let second = auth_header_fingerprint("Basic YWRtaW46cGFzcw==");
+        let different = auth_header_fingerprint("Basic YWRtaW46d3Jvbmc=");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
     }
 
     #[test]
