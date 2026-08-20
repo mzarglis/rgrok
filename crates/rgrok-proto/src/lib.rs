@@ -4,6 +4,13 @@ pub mod messages;
 pub mod subdomain;
 pub mod transport;
 
+/// Version of the control protocol exchanged during authentication.
+///
+/// This is intentionally separate from the wire message's field name (which
+/// historically carries the client package version) so the server can reject
+/// incompatible peers before creating a tunnel.
+pub const CONTROL_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use errors::TunnelError;
 pub use inspect::{CapturedRequest, InspectEvent};
 pub use messages::*;

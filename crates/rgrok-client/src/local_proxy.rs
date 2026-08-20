@@ -56,7 +56,7 @@ where
     let req_data = &req_buf[..req_n];
 
     // Parse request for capture
-    let capture = parse_request_for_capture(req_data);
+    let capture = parse_request_for_capture_with_limit(req_data, inspect.max_body_bytes);
 
     // Forward request data to local service
     local.write_all(req_data).await?;
@@ -85,10 +85,10 @@ where
         let body_start = find_body_offset(resp_data);
         if let Some(offset) = body_start {
             if offset < resp_data.len() {
-                let body_len = (resp_data.len() - offset).min(1_048_576);
-                cap.resp_body = Some(Bytes::copy_from_slice(
-                    &resp_data[offset..offset + body_len],
-                ));
+                let body = &resp_data[offset..];
+                let (captured, truncated) = capture_body(body, inspect.max_body_bytes);
+                cap.resp_body = captured;
+                cap.resp_body_truncated = truncated;
             }
         }
         cap.duration_ms = Some(start.elapsed().as_millis() as u64);
@@ -107,7 +107,10 @@ where
     Ok(())
 }
 
-fn parse_request_for_capture(data: &[u8]) -> Option<CapturedRequest> {
+fn parse_request_for_capture_with_limit(
+    data: &[u8],
+    max_body_bytes: usize,
+) -> Option<CapturedRequest> {
     let request_str = String::from_utf8_lossy(data);
     let mut lines = request_str.lines();
 
@@ -130,8 +133,7 @@ fn parse_request_for_capture(data: &[u8]) -> Option<CapturedRequest> {
     let body = body_offset.and_then(|pos| {
         if pos < data.len() {
             let body_bytes = &data[pos..];
-            let capture_len = body_bytes.len().min(1_048_576);
-            Some(Bytes::copy_from_slice(&body_bytes[..capture_len]))
+            capture_body(body_bytes, max_body_bytes).0
         } else {
             None
         }
@@ -153,6 +155,13 @@ fn parse_request_for_capture(data: &[u8]) -> Option<CapturedRequest> {
         remote_addr: String::new(),
         tls_version: None,
     })
+}
+
+fn capture_body(body: &[u8], max_body_bytes: usize) -> (Option<Bytes>, bool) {
+    let truncated = body.len() > max_body_bytes;
+    let captured = (!body.is_empty() && max_body_bytes > 0)
+        .then(|| Bytes::copy_from_slice(&body[..body.len().min(max_body_bytes)]));
+    (captured, truncated)
 }
 
 fn parse_response_status(data: &[u8]) -> Option<u16> {
@@ -192,7 +201,8 @@ mod tests {
     #[test]
     fn parse_request_for_capture_valid_http() {
         let req = b"GET /api/test HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\n\r\n";
-        let cap = parse_request_for_capture(req).expect("should parse valid request");
+        let cap = parse_request_for_capture_with_limit(req, 1_048_576)
+            .expect("should parse valid request");
         assert_eq!(cap.req_method, "GET");
         assert_eq!(cap.req_url, "/api/test");
         assert_eq!(cap.req_headers.len(), 2);
@@ -211,7 +221,8 @@ mod tests {
     #[test]
     fn parse_request_for_capture_with_body() {
         let req = b"POST /submit HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world";
-        let cap = parse_request_for_capture(req).expect("should parse POST request");
+        let cap = parse_request_for_capture_with_limit(req, 1_048_576)
+            .expect("should parse POST request");
         assert_eq!(cap.req_method, "POST");
         assert_eq!(cap.req_url, "/submit");
         assert_eq!(cap.req_headers.len(), 1);
@@ -220,14 +231,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_for_capture_honors_configured_body_limit() {
+        let req = b"POST /submit HTTP/1.1\r\n\r\nhello world";
+        let cap = parse_request_for_capture_with_limit(req, 5).unwrap();
+        assert_eq!(&cap.req_body.unwrap()[..], b"hello");
+    }
+
+    #[test]
     fn parse_request_for_capture_empty_data_returns_none() {
-        assert!(parse_request_for_capture(b"").is_none());
+        assert!(parse_request_for_capture_with_limit(b"", 1_048_576).is_none());
     }
 
     #[test]
     fn parse_request_for_capture_malformed_returns_none() {
         // A single word with no whitespace means parts.next() for url returns None
-        assert!(parse_request_for_capture(b"GARBAGE\r\n\r\n").is_none());
+        assert!(parse_request_for_capture_with_limit(b"GARBAGE\r\n\r\n", 1_048_576).is_none());
     }
 
     #[test]

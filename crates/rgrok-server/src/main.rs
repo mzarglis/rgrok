@@ -253,6 +253,7 @@ mod tests {
         config::Config {
             server: config::ServerConfig {
                 domain: "tunnel.test.local".to_string(),
+                public_ip: None,
                 control_port,
                 https_port,
                 http_port,
@@ -307,6 +308,14 @@ mod tests {
         let http_port = find_free_port().await;
         let https_port = find_free_port().await;
         let cfg = test_config(port, http_port, https_port);
+        start_test_server_with_config(listener, cfg).await
+    }
+
+    async fn start_test_server_with_config(
+        listener: tokio::net::TcpListener,
+        cfg: config::Config,
+    ) -> (u16, Arc<tunnel_manager::ServerState>) {
+        let port = listener.local_addr().unwrap().port();
         let state = Arc::new(tunnel_manager::ServerState::new(cfg));
 
         let s = state.clone();
@@ -383,6 +392,104 @@ mod tests {
             "Expected AuthErr, got {:?}",
             msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_auth_allowlist_rejects_unlisted_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let http_port = find_free_port().await;
+        let https_port = find_free_port().await;
+        let mut cfg = test_config(port, http_port, https_port);
+        cfg.auth.tokens = vec!["different-token".to_string()];
+        let (port, _state) = start_test_server_with_config(listener, cfg).await;
+        let ws = connect_ws(port).await;
+        let ws_compat = WsCompat::new(ws);
+        let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
+        let (control, _rx, _handle) = spawn_yamux_driver(mux);
+        let mut ctrl = control.open_stream().await.unwrap();
+        write_msg_to_stream(
+            &mut ctrl,
+            &ClientMsg::Auth {
+                token: test_token(),
+                version: "0.1.0".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let response: ServerMsg = read_msg_from_stream(&mut ctrl).await.unwrap();
+        match response {
+            ServerMsg::AuthErr { reason } => assert!(reason.contains("not authorized")),
+            other => panic!("expected allowlist rejection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_protocol_version_mismatch() {
+        let (port, _state) = start_test_server().await;
+        let ws = connect_ws(port).await;
+        let ws_compat = WsCompat::new(ws);
+        let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
+        let (control, _rx, _handle) = spawn_yamux_driver(mux);
+        let mut ctrl = control.open_stream().await.unwrap();
+        write_msg_to_stream(
+            &mut ctrl,
+            &ClientMsg::Auth {
+                token: test_token(),
+                version: "incompatible".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let response: ServerMsg = read_msg_from_stream(&mut ctrl).await.unwrap();
+        match response {
+            ServerMsg::AuthErr { reason } => assert!(reason.contains("protocol version mismatch")),
+            other => panic!("expected protocol rejection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_active_session_closes_when_jti_is_revoked() {
+        let (port, state) = start_test_server().await;
+        let token = test_token();
+        let jti = auth::validate_token(&token, TEST_SECRET).unwrap().jti;
+        let ws = connect_ws(port).await;
+        let ws_compat = WsCompat::new(ws);
+        let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Client);
+        let (control, _rx, _handle) = spawn_yamux_driver(mux);
+        let mut ctrl = control.open_stream().await.unwrap();
+        write_msg_to_stream(
+            &mut ctrl,
+            &ClientMsg::Auth {
+                token,
+                version: "0.1.0".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_msg_from_stream::<ServerMsg>(&mut ctrl).await.unwrap(),
+            ServerMsg::AuthOk { .. }
+        ));
+
+        write_msg_to_stream(&mut ctrl, &ClientMsg::Ping { seq: 1 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_msg_from_stream::<ServerMsg>(&mut ctrl).await.unwrap(),
+            ServerMsg::Pong { seq: 1 }
+        ));
+
+        state.reload_revoked_jtis(&[jti]).await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_msg_from_stream::<ServerMsg>(&mut ctrl),
+        )
+        .await
+        .expect("revocation close timed out");
+        if let Ok(response) = response {
+            assert!(matches!(response, ServerMsg::Error { code: 401, .. }));
+        }
     }
 
     #[tokio::test]

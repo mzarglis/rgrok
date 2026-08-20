@@ -66,6 +66,7 @@ Edit `/etc/rgrok/server.toml`:
 ```toml
 [server]
 domain = "tunnel.example.com"   # your domain
+# public_ip = "203.0.113.10"      # required only when per_tunnel_dns = true
 control_port = 7835
 https_port = 443
 http_port = 80
@@ -77,6 +78,7 @@ tunnel_idle_timeout_secs = 300
 # Generate with: openssl rand -hex 32
 secret = "CHANGEME_replace_with_output_of_openssl_rand_hex_32"
 tokens = []
+# When non-empty, only these exact generated token strings may authenticate.
 
 [tls]
 acme_env = "production"         # use "staging" for testing to avoid rate limits
@@ -88,6 +90,8 @@ api_token = "your-cloudflare-api-token"
 zone_id = "your-cloudflare-zone-id"
 dns_ttl = 1
 per_tunnel_dns = false          # wildcard A record is sufficient (recommended)
+# Set per_tunnel_dns = true only with server.public_ip and Cloudflare DNS credentials.
+# Existing configs enabling per_tunnel_dns must add public_ip before upgrading.
 
 [logging]
 level = "info"

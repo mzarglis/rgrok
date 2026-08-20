@@ -58,7 +58,7 @@ pub async fn run(config: ClientConfig, tunnel_cfg: TunnelConfig) -> anyhow::Resu
         &mut ctrl_stream,
         &ClientMsg::Auth {
             token: config.auth.token.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
         },
     )
     .await?;
@@ -107,7 +107,10 @@ pub async fn run(config: ClientConfig, tunnel_cfg: TunnelConfig) -> anyhow::Resu
 
     // Start inspection UI if enabled
     let inspect_state = if tunnel_cfg.inspect_port > 0 {
-        let state = Arc::new(InspectState::new(tunnel_cfg.local_port));
+        let state = Arc::new(InspectState::with_max_body_bytes(
+            tunnel_cfg.local_port,
+            config.defaults.max_body_bytes,
+        ));
         let ui_state = state.clone();
         let port = tunnel_cfg.inspect_port;
         tokio::spawn(async move {

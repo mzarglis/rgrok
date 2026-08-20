@@ -4,6 +4,8 @@
 [server]
 # Hostname of your VPS (used for TLS cert and DNS)
 domain = "tunnel.mysite.com"
+# Public IPv4 used for per-tunnel Cloudflare A records (required when enabled)
+# public_ip = "203.0.113.10"
 
 # Port the control WebSocket listens on (clients connect here)
 control_port = 7835

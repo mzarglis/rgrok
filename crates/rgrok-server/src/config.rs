@@ -14,6 +14,9 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub domain: String,
+    /// Public IPv4 address used for per-tunnel Cloudflare A records.
+    #[serde(default)]
+    pub public_ip: Option<String>,
     #[serde(default = "default_control_port")]
     pub control_port: u16,
     #[serde(default = "default_https_port")]
@@ -148,6 +151,24 @@ impl Config {
         if self.server.tcp_port_range[0] >= self.server.tcp_port_range[1] {
             anyhow::bail!("server.tcp_port_range start must be less than end");
         }
+        if self.server.tunnel_idle_timeout_secs == 0 {
+            anyhow::bail!("server.tunnel_idle_timeout_secs must be greater than zero");
+        }
+        if self.cloudflare.per_tunnel_dns {
+            if self.cloudflare.api_token.is_empty() || self.cloudflare.zone_id.is_empty() {
+                anyhow::bail!(
+                    "cloudflare.api_token and cloudflare.zone_id are required when per_tunnel_dns is enabled"
+                );
+            }
+            let public_ip = self.server.public_ip.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "server.public_ip is required when cloudflare.per_tunnel_dns is enabled"
+                )
+            })?;
+            if public_ip.parse::<std::net::Ipv4Addr>().is_err() {
+                anyhow::bail!("server.public_ip must be a valid IPv4 address");
+            }
+        }
         Ok(())
     }
 }
@@ -178,6 +199,7 @@ impl Default for Config {
         Self {
             server: ServerConfig {
                 domain: "tunnel.example.com".to_string(),
+                public_ip: None,
                 control_port: default_control_port(),
                 https_port: default_https_port(),
                 http_port: default_http_port(),
@@ -397,5 +419,33 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
     fn test_default_impl_validates() {
         let config = Config::default();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_per_tunnel_dns_requires_public_ip_and_credentials() {
+        let mut config = Config::default();
+        config.cloudflare.per_tunnel_dns = true;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("api_token and cloudflare.zone_id"));
+
+        config.cloudflare.api_token = "token".to_string();
+        config.cloudflare.zone_id = "zone".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("server.public_ip is required"));
+
+        config.server.public_ip = Some("not-an-ip".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("valid IPv4"));
+
+        config.server.public_ip = Some("203.0.113.10".to_string());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_zero_idle_timeout_rejected() {
+        let mut config = Config::default();
+        config.server.tunnel_idle_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("tunnel_idle_timeout_secs"));
     }
 }

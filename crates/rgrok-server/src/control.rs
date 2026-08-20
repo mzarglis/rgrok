@@ -8,7 +8,9 @@ use tracing::{info, warn};
 
 use rgrok_proto::messages::*;
 use rgrok_proto::transport::{read_msg_from_stream, write_msg_to_stream, yamux_config, WsCompat};
-use rgrok_proto::{generate_subdomain, spawn_yamux_driver, validate_subdomain};
+use rgrok_proto::{
+    generate_subdomain, spawn_yamux_driver, validate_subdomain, CONTROL_PROTOCOL_VERSION,
+};
 
 use crate::auth;
 use crate::tunnel_manager::{ConnectionStreamState, ServerState, TunnelSession};
@@ -21,6 +23,26 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let bind_addr = listener.local_addr()?;
     info!("Control plane listening on {}", bind_addr);
+
+    // Reap idle tunnels even when no public request arrives to trigger a
+    // routing lookup. The task exits with the shared server cancellation token.
+    let reaper_state = state.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(
+            reaper_state
+                .config
+                .server
+                .tunnel_idle_timeout_secs
+                .clamp(1, 60),
+        );
+        let mut interval = tokio::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => reaper_state.reap_idle_tunnels(Instant::now()).await,
+                _ = reaper_state.cancel.cancelled() => break,
+            }
+        }
+    });
 
     loop {
         let (tcp_stream, peer_addr) = tokio::select! {
@@ -111,7 +133,7 @@ where
         }
     };
 
-    let (token, _version) = match auth_msg {
+    let (token, version) = match auth_msg {
         ClientMsg::Auth { token, version } => (token, version),
         _ => {
             warn!("First message was not Auth");
@@ -126,6 +148,40 @@ where
             return;
         }
     };
+
+    if version != CONTROL_PROTOCOL_VERSION {
+        warn!(client = %version, server = %CONTROL_PROTOCOL_VERSION, "Control protocol version mismatch");
+        let _ = write_msg_to_stream(
+            &mut ctrl_stream,
+            &ServerMsg::AuthErr {
+                reason: format!(
+                    "protocol version mismatch: client={}, server={}",
+                    version, CONTROL_PROTOCOL_VERSION
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+
+    if !state.config.auth.tokens.is_empty()
+        && !state
+            .config
+            .auth
+            .tokens
+            .iter()
+            .any(|allowed| allowed == &token)
+    {
+        warn!("Auth token is not in the configured allowlist");
+        let _ = write_msg_to_stream(
+            &mut ctrl_stream,
+            &ServerMsg::AuthErr {
+                reason: "token is not authorized".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
 
     // Step 2: Validate JWT
     let claims = match auth::validate_token(&token, &state.config.auth.secret) {
@@ -180,6 +236,7 @@ where
     // receives this exact registry, so an inbound stream can never resolve a
     // request belonging to another WebSocket connection.
     let stream_state = Arc::new(ConnectionStreamState::new());
+    let mut revocation_epoch = state.revocation_epoch.subscribe();
 
     // Track resources for cleanup
     let mut registered_subdomains: Vec<(String, Arc<TunnelSession>)> = Vec::new();
@@ -198,6 +255,22 @@ where
 
     // Step 5: Main control loop — interleave reads and writes
     loop {
+        // Catch a revocation reload that raced the next select call.
+        if state.is_jti_revoked(&claims.jti).await {
+            warn!(jti = %claims.jti, "Active session token has been revoked");
+            if let Err(e) = write_msg_to_stream(
+                &mut ctrl_stream,
+                &ServerMsg::Error {
+                    code: 401,
+                    message: "token has been revoked".to_string(),
+                },
+            )
+            .await
+            {
+                warn!("Failed to send revocation error to client: {}", e);
+            }
+            break;
+        }
         tokio::select! {
             result = read_msg_from_stream::<ClientMsg>(&mut ctrl_stream) => {
                 let msg = match result {
@@ -219,33 +292,36 @@ where
                 info!(session_id = %session_id, "Graceful shutdown: closing client session");
                 break;
             }
+            result = revocation_epoch.changed() => {
+                if result.is_err() || state.is_jti_revoked(&claims.jti).await {
+                    warn!(jti = %claims.jti, "Active session token has been revoked");
+                    if let Err(e) = write_msg_to_stream(
+                        &mut ctrl_stream,
+                        &ServerMsg::Error {
+                            code: 401,
+                            message: "token has been revoked".to_string(),
+                        },
+                    )
+                    .await
+                    {
+                        warn!("Failed to send revocation error to client: {}", e);
+                    }
+                    break;
+                }
+            }
         }
     }
 
     // Cleanup
     info!(session_id = %session_id, "Client disconnected, cleaning up tunnels");
     for (subdomain, session) in &registered_subdomains {
-        state.unregister_tunnel_if_owner(subdomain, session);
+        if let Some(removed) = state.unregister_tunnel_if_owner(subdomain, session) {
+            state.delete_dns_record(&removed).await;
+        }
     }
     for (port, expected) in &registered_tcp_ports {
-        if let Some(tunnel) = state.remove_tcp_tunnel_if_owner(*port, expected) {
-            // Cancellation closes the accept loop. Wait for the listener task
-            // to drop its socket before allowing this port to be reused.
-            let listener_stopped = match tunnel.listener_stopped.lock().await.take() {
-                Some(listener_stopped) => matches!(
-                    tokio::time::timeout(Duration::from_secs(5), listener_stopped).await,
-                    Ok(Ok(()))
-                ),
-                None => true,
-            };
-            if listener_stopped {
-                state.release_tcp_port_reservation(*port, &tunnel.id);
-            } else {
-                warn!(
-                    port,
-                    "TCP listener did not stop; retaining port reservation"
-                );
-            }
+        if let Some(removed) = state.shutdown_tcp_tunnel_if_owner(*port, expected).await {
+            state.delete_dns_record(&removed).await;
         }
     }
     accept_handle.abort();
@@ -387,6 +463,25 @@ async fn handle_control_msg(
             // The session retains only the username and bcrypt hash.
             drop(basic_auth);
 
+            let dns_record_id = match &tunnel_type {
+                TunnelType::Http | TunnelType::Https => {
+                    match state.create_dns_record(&assigned_subdomain).await {
+                        Ok(record_id) => record_id,
+                        Err(e) => {
+                            state.release_http_tunnel(&assigned_subdomain, &id);
+                            let _ = control_tx
+                                .send(ServerMsg::Error {
+                                    code: 503,
+                                    message: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                TunnelType::Tcp { .. } => None,
+            };
+
             let public_url = match (&tunnel_type, tcp_port) {
                 (TunnelType::Http, None) | (TunnelType::Https, None) => {
                     format!(
@@ -411,6 +506,10 @@ async fn handle_control_msg(
                 basic_auth_hash,
                 options,
                 created_at: Instant::now(),
+                last_activity: std::sync::Mutex::new(Instant::now()),
+                active_streams: std::sync::atomic::AtomicUsize::new(0),
+                dns_record_id,
+                idle_cancel: tokio_util::sync::CancellationToken::new(),
                 control_tx: control_tx.clone(),
                 stream_state: stream_state.clone(),
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -428,6 +527,7 @@ async fn handle_control_msg(
                                 message: e.to_string(),
                             })
                             .await;
+                        state.delete_dns_record(&session).await;
                         return;
                     }
                     registered_subdomains.push((assigned_subdomain.clone(), session.clone()));

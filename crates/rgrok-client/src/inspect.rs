@@ -22,16 +22,19 @@ pub struct InspectState {
     pub inspect_tx: broadcast::Sender<InspectEvent>,
     pub local_port: u16,
     pub max_captures: usize,
+    /// Maximum number of request/response body bytes retained per capture.
+    pub max_body_bytes: usize,
 }
 
 impl InspectState {
-    pub fn new(local_port: u16) -> Self {
+    pub fn with_max_body_bytes(local_port: u16, max_body_bytes: usize) -> Self {
         let (inspect_tx, _) = broadcast::channel(256);
         Self {
             captures: Mutex::new(VecDeque::with_capacity(100)),
             inspect_tx,
             local_port,
             max_captures: 100,
+            max_body_bytes,
         }
     }
 
@@ -136,14 +139,10 @@ async fn replay_request(
                 .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.to_string(), vs.to_string())))
                 .collect();
             let resp_body_bytes = resp.bytes().await.ok();
-            let resp_body_truncated = resp_body_bytes
-                .as_ref()
-                .map(|b| b.len() > 1_048_576)
-                .unwrap_or(false);
-            let resp_body = resp_body_bytes.map(|b| {
-                let len = b.len().min(1_048_576);
-                bytes::Bytes::copy_from_slice(&b[..len])
-            });
+            let (resp_body, resp_body_truncated) = resp_body_bytes
+                .as_deref()
+                .map(|body| capture_body(body, state.max_body_bytes))
+                .unwrap_or((None, false));
 
             let new_id = uuid::Uuid::new_v4().to_string();
             let replay_capture = rgrok_proto::inspect::CapturedRequest {
@@ -171,6 +170,13 @@ async fn replay_request(
             Err(StatusCode::BAD_GATEWAY)
         }
     }
+}
+
+fn capture_body(body: &[u8], max_body_bytes: usize) -> (Option<bytes::Bytes>, bool) {
+    let truncated = body.len() > max_body_bytes;
+    let captured = (!body.is_empty() && max_body_bytes > 0)
+        .then(|| bytes::Bytes::copy_from_slice(&body[..body.len().min(max_body_bytes)]));
+    (captured, truncated)
 }
 
 async fn event_stream(
@@ -214,7 +220,7 @@ mod tests {
         });
 
         // Create inspect state pointing to the mock service
-        let state = Arc::new(InspectState::new(mock_port));
+        let state = Arc::new(InspectState::with_max_body_bytes(mock_port, 1_048_576));
 
         // Store a captured request to replay
         let capture = CapturedRequest {
@@ -278,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay_nonexistent_request_returns_404() {
-        let state = Arc::new(InspectState::new(9999));
+        let state = Arc::new(InspectState::with_max_body_bytes(9999, 1_048_576));
 
         let app = Router::new()
             .route("/api/requests/{id}/replay", post(replay_request))

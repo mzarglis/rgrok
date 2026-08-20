@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
@@ -12,6 +12,7 @@ use rgrok_proto::messages::{ServerMsg, TunnelOptions, TunnelType};
 
 use crate::auth::BasicAuthVerifier;
 use crate::config::Config;
+use crate::dns::CloudflareClient;
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 enum ReservationKey {
@@ -45,6 +46,8 @@ pub struct ServerState {
     pub cancel: CancellationToken,
     /// Blocklist of revoked JWT IDs (jti) — reloadable via SIGHUP
     pub revoked_jtis: RwLock<HashSet<String>>,
+    /// Monotonic generation incremented whenever the revocation list reloads.
+    pub revocation_epoch: tokio::sync::watch::Sender<u64>,
     /// Prometheus metrics
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Bounded bcrypt verifier shared by public HTTP handlers.
@@ -55,6 +58,8 @@ pub struct ServerState {
     pub tls_config_rx: tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
     /// Notify when a tunnel is unregistered (useful for tests)
     pub cleanup_notify: Arc<tokio::sync::Notify>,
+    /// Cloudflare client used for optional per-tunnel DNS records.
+    pub dns_client: Option<Arc<CloudflareClient>>,
 }
 
 impl ServerState {
@@ -62,6 +67,13 @@ impl ServerState {
         let (inspect_tx, _) = broadcast::channel(256);
         let revoked: HashSet<String> = config.auth.revoked_jtis.iter().cloned().collect();
         let (tls_tx, tls_rx) = tokio::sync::watch::channel(None);
+        let (revocation_epoch, _) = tokio::sync::watch::channel(0);
+        let dns_client = config.cloudflare.per_tunnel_dns.then(|| {
+            Arc::new(CloudflareClient::new(
+                config.cloudflare.api_token.clone(),
+                config.cloudflare.zone_id.clone(),
+            ))
+        });
         Self {
             config,
             tunnels: DashMap::new(),
@@ -71,11 +83,13 @@ impl ServerState {
             inspect_tx,
             cancel: CancellationToken::new(),
             revoked_jtis: RwLock::new(revoked),
+            revocation_epoch,
             metrics: Arc::new(crate::metrics::Metrics::new()),
             basic_auth_verifier: BasicAuthVerifier::default(),
             tls_config: tls_tx,
             tls_config_rx: tls_rx,
             cleanup_notify: Arc::new(tokio::sync::Notify::new()),
+            dns_client,
         }
     }
 
@@ -90,6 +104,7 @@ impl ServerState {
         let mut blocklist = self.revoked_jtis.write().await;
         blocklist.clear();
         blocklist.extend(jtis.iter().cloned());
+        self.revocation_epoch.send_modify(|epoch| *epoch += 1);
     }
 
     /// Register a new tunnel, returning the assigned subdomain
@@ -170,19 +185,27 @@ impl ServerState {
 
     /// Unregister a tunnel by subdomain
     #[allow(dead_code)]
-    pub fn unregister_tunnel(&self, subdomain: &str) {
-        self.remove_tunnel_if_owner(subdomain, None);
+    pub fn unregister_tunnel(&self, subdomain: &str) -> Option<Arc<TunnelSession>> {
+        self.remove_tunnel_if_owner(subdomain, None)
     }
 
     /// Unregister an HTTP tunnel only if it is still owned by `session`.
     ///
     /// A disconnected older session can otherwise remove a newer tunnel that
     /// has reused the same name after the old entry was removed.
-    pub fn unregister_tunnel_if_owner(&self, subdomain: &str, session: &Arc<TunnelSession>) {
-        self.remove_tunnel_if_owner(subdomain, Some(session));
+    pub fn unregister_tunnel_if_owner(
+        &self,
+        subdomain: &str,
+        session: &Arc<TunnelSession>,
+    ) -> Option<Arc<TunnelSession>> {
+        self.remove_tunnel_if_owner(subdomain, Some(session))
     }
 
-    fn remove_tunnel_if_owner(&self, subdomain: &str, owner: Option<&Arc<TunnelSession>>) -> bool {
+    fn remove_tunnel_if_owner(
+        &self,
+        subdomain: &str,
+        owner: Option<&Arc<TunnelSession>>,
+    ) -> Option<Arc<TunnelSession>> {
         let _reservations = self.lock_reservations();
         let current = self
             .tunnels
@@ -192,10 +215,11 @@ impl ServerState {
             .as_ref()
             .is_some_and(|current| owner.is_none_or(|owner| Arc::ptr_eq(current, owner)));
         if !should_remove {
-            return false;
+            return None;
         }
-        let removed = self.tunnels.remove(subdomain).is_some();
-        if removed {
+        let removed = self.tunnels.remove(subdomain).map(|(_, tunnel)| tunnel);
+        if let Some(tunnel) = &removed {
+            tunnel.idle_cancel.cancel();
             self.captures.remove(subdomain);
             self.metrics.active_tunnels.dec();
             self.cleanup_notify.notify_waiters();
@@ -314,6 +338,7 @@ impl ServerState {
         let removed = self.tcp_tunnels.remove(&port).map(|(_, tunnel)| tunnel);
         if let Some(tunnel) = &removed {
             tunnel.cancel.cancel();
+            tunnel.idle_cancel.cancel();
             self.metrics.active_tunnels.dec();
             self.cleanup_notify.notify_waiters();
         }
@@ -345,11 +370,115 @@ impl ServerState {
         if let Some((_, removed)) = self.tcp_tunnels.remove(&port) {
             reservations.insert(ReservationKey::Tcp(port), removed.id.clone());
             removed.cancel.cancel();
+            removed.idle_cancel.cancel();
             self.metrics.active_tunnels.dec();
             self.cleanup_notify.notify_waiters();
             Some(removed)
         } else {
             None
+        }
+    }
+
+    /// Remove an owned TCP tunnel, cancel its listener, and release the port
+    /// reservation only after the listener confirms its socket was dropped.
+    pub async fn shutdown_tcp_tunnel_if_owner(
+        &self,
+        port: u16,
+        session: &Arc<TunnelSession>,
+    ) -> Option<Arc<TunnelSession>> {
+        let removed = self.remove_tcp_tunnel_if_owner(port, session)?;
+        let listener_stopped = match removed.listener_stopped.lock().await.take() {
+            Some(listener_stopped) => matches!(
+                tokio::time::timeout(Duration::from_secs(5), listener_stopped).await,
+                Ok(Ok(()))
+            ),
+            None => true,
+        };
+        if listener_stopped {
+            self.release_tcp_port_reservation(port, &removed.id);
+        } else {
+            tracing::warn!(
+                port,
+                "TCP listener did not stop; retaining port reservation"
+            );
+        }
+        Some(removed)
+    }
+
+    /// Create a DNS record for a newly reserved HTTP tunnel, when enabled.
+    pub async fn create_dns_record(&self, subdomain: &str) -> anyhow::Result<Option<String>> {
+        let Some(client) = &self.dns_client else {
+            return Ok(None);
+        };
+        let public_ip = self.config.server.public_ip.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "server.public_ip is required when cloudflare.per_tunnel_dns is enabled"
+            )
+        })?;
+        let name = format!("{}.{}", subdomain, self.config.server.domain);
+        client
+            .create_record(&name, public_ip, self.config.cloudflare.dns_ttl)
+            .await
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("failed to create DNS record for {name}: {error}"))
+    }
+
+    /// Delete a tunnel's owned DNS record. Cleanup is best-effort after the
+    /// routing entry has already been removed.
+    pub async fn delete_dns_record(&self, session: &TunnelSession) {
+        let (Some(client), Some(record_id)) = (&self.dns_client, &session.dns_record_id) else {
+            return;
+        };
+        if let Err(error) = client.delete_record(record_id).await {
+            tracing::warn!(record_id = %record_id, "Failed to delete tunnel DNS record: {error}");
+        }
+    }
+
+    /// Remove tunnels with no public traffic or active streams for the
+    /// configured idle period.
+    pub async fn reap_idle_tunnels(&self, now: Instant) {
+        let timeout = Duration::from_secs(self.config.server.tunnel_idle_timeout_secs);
+
+        let http_candidates: Vec<(String, Arc<TunnelSession>)> = self
+            .tunnels
+            .iter()
+            .filter_map(|entry| {
+                let session = entry.value().clone();
+                session
+                    .is_idle(now, timeout)
+                    .then(|| (entry.key().clone(), session))
+            })
+            .collect();
+        for (subdomain, session) in http_candidates {
+            if let Some(removed) = self.unregister_tunnel_if_owner(&subdomain, &session) {
+                let _ = removed.control_tx.try_send(ServerMsg::Error {
+                    code: 408,
+                    message: "tunnel closed after idle timeout".to_string(),
+                });
+                self.delete_dns_record(&removed).await;
+                tracing::info!(subdomain = %subdomain, "Closed idle tunnel");
+            }
+        }
+
+        let tcp_candidates: Vec<(u16, Arc<TunnelSession>)> = self
+            .tcp_tunnels
+            .iter()
+            .filter_map(|entry| {
+                let session = entry.value().clone();
+                session
+                    .is_idle(now, timeout)
+                    .then(|| (*entry.key(), session))
+            })
+            .collect();
+        for (port, session) in tcp_candidates {
+            if let Some(removed) = self.shutdown_tcp_tunnel_if_owner(port, &session).await {
+                let _ = removed.control_tx.try_send(ServerMsg::Error {
+                    code: 408,
+                    message: "tunnel closed after idle timeout".to_string(),
+                });
+                self.delete_dns_record(&removed).await;
+                tracing::info!(port, "Closed idle TCP tunnel");
+            }
         }
     }
 
@@ -411,6 +540,14 @@ pub struct TunnelSession {
     pub options: TunnelOptions,
     #[allow(dead_code)]
     pub created_at: Instant,
+    /// Last time this tunnel handled public traffic.
+    pub last_activity: StdMutex<Instant>,
+    /// Number of currently active proxied streams.
+    pub active_streams: AtomicUsize,
+    /// Cloudflare record created for this tunnel, if enabled.
+    pub dns_record_id: Option<String>,
+    /// Cancellation signal used by idle cleanup and session teardown.
+    pub idle_cancel: CancellationToken,
     /// Sink to send messages to the connected client
     pub control_tx: mpsc::Sender<ServerMsg>,
     /// Connection-scoped stream IDs and pending data streams.
@@ -427,6 +564,32 @@ pub struct TunnelSession {
 impl TunnelSession {
     pub fn next_correlation_id(&self) -> u32 {
         self.stream_state.next_correlation_id()
+    }
+
+    pub fn touch(&self) {
+        if let Ok(mut last_activity) = self.last_activity.lock() {
+            *last_activity = Instant::now();
+        }
+    }
+
+    pub fn stream_started(&self) {
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    pub fn stream_finished(&self) {
+        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    pub fn is_idle(&self, now: Instant, timeout: Duration) -> bool {
+        if self.active_streams.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        self.last_activity
+            .lock()
+            .map(|last_activity| now.duration_since(*last_activity) >= timeout)
+            .unwrap_or(false)
     }
 }
 
@@ -471,6 +634,10 @@ mod tests {
             basic_auth_hash: None,
             options: TunnelOptions::default(),
             created_at: Instant::now(),
+            last_activity: StdMutex::new(Instant::now()),
+            active_streams: AtomicUsize::new(0),
+            dns_record_id: None,
+            idle_cancel: CancellationToken::new(),
             control_tx: tx,
             stream_state: Arc::new(ConnectionStreamState::new()),
             cancel: CancellationToken::new(),
@@ -718,6 +885,10 @@ mod tests {
             basic_auth_hash: None,
             options: TunnelOptions::default(),
             created_at: Instant::now(),
+            last_activity: StdMutex::new(Instant::now()),
+            active_streams: AtomicUsize::new(0),
+            dns_record_id: None,
+            idle_cancel: CancellationToken::new(),
             control_tx: tx,
             stream_state: Arc::new(ConnectionStreamState::new()),
             cached_auth_fingerprint: Mutex::new(None),

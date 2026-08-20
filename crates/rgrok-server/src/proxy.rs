@@ -190,6 +190,9 @@ async fn proxy_http_request(
         }
     }
 
+    // Only authenticated public traffic keeps an idle tunnel alive.
+    tunnel.touch();
+
     // Request a proxy stream from the client
     let mut proxy_stream = match request_proxy_stream(&tunnel).await {
         Some(s) => s,
@@ -579,10 +582,16 @@ pub async fn serve_tcp_tunnel_on_listener(
                 info!(port, "TCP tunnel listener cancelled");
                 return Ok(());
             }
+            _ = tunnel.idle_cancel.cancelled() => {
+                info!(port, "TCP tunnel closed after idle timeout");
+                return Ok(());
+            }
         };
+        tunnel.touch();
         let tunnel = tunnel.clone();
 
         tokio::spawn(async move {
+            tunnel.stream_started();
             tokio::select! {
                 _ = tunnel.cancel.cancelled() => {}
                 result = async {
@@ -594,6 +603,7 @@ pub async fn serve_tcp_tunnel_on_listener(
                     let _ = tokio::io::copy_bidirectional(&mut incoming, &mut proxy_stream).await;
                 } => result,
             }
+            tunnel.stream_finished();
         });
     }
 }
