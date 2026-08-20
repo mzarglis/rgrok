@@ -10,7 +10,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info, warn};
@@ -269,9 +269,15 @@ async fn proxy_http_request(
     // Hyper has decoded the public framing. Bound collection before opening a
     // tunnel stream so a slow/oversized upload cannot occupy client capacity.
     let (parts, body) = req.into_parts();
-    let body_permit = match state.request_body_slots.clone().acquire_owned().await {
+    let body_permit = match state.request_body_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => {
+        Err(TryAcquireError::NoPermits) => {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is busy",
+            ));
+        }
+        Err(TryAcquireError::Closed) => {
             return Ok(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Server is shutting down",

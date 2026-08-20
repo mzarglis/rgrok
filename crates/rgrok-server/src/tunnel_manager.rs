@@ -385,26 +385,34 @@ impl ServerState {
     /// Remove an owned TCP tunnel, cancel its listener, and release the port
     /// reservation only after the listener confirms its socket was dropped.
     pub async fn shutdown_tcp_tunnel_if_owner(
-        &self,
+        self: &Arc<Self>,
         port: u16,
         session: &Arc<TunnelSession>,
     ) -> Option<Arc<TunnelSession>> {
         let removed = self.remove_tcp_tunnel_if_owner(port, session)?;
-        let listener_stopped = match removed.listener_stopped.lock().await.take() {
-            Some(listener_stopped) => matches!(
-                tokio::time::timeout(Duration::from_secs(5), listener_stopped).await,
-                Ok(Ok(()))
-            ),
-            None => true,
-        };
-        if listener_stopped {
-            self.release_tcp_port_reservation(port, &removed.id);
-        } else {
-            self.metrics.tcp_reservations_retained.inc();
-            tracing::warn!(
-                port,
-                "TCP listener did not stop; retaining port reservation"
-            );
+        match removed.listener_stopped.lock().await.take() {
+            Some(mut listener_stopped) => {
+                if tokio::time::timeout(Duration::from_secs(5), &mut listener_stopped)
+                    .await
+                    .is_ok()
+                {
+                    self.release_tcp_port_reservation(port, &removed.id);
+                } else {
+                    self.metrics.tcp_reservations_retained.inc();
+                    tracing::warn!(
+                        port,
+                        "TCP listener did not stop; retaining port reservation until completion"
+                    );
+                    let state = self.clone();
+                    let owner = removed.id.clone();
+                    tokio::spawn(async move {
+                        let _ = listener_stopped.await;
+                        state.release_tcp_port_reservation(port, &owner);
+                        state.metrics.tcp_reservations_retained.dec();
+                    });
+                }
+            }
+            None => self.release_tcp_port_reservation(port, &removed.id),
         }
         Some(removed)
     }
@@ -440,7 +448,7 @@ impl ServerState {
 
     /// Remove tunnels with no public traffic or active streams for the
     /// configured idle period.
-    pub async fn reap_idle_tunnels(&self, now: Instant) {
+    pub async fn reap_idle_tunnels(self: &Arc<Self>, now: Instant) {
         let timeout = Duration::from_secs(self.config.server.tunnel_idle_timeout_secs);
 
         let http_candidates: Vec<(String, Arc<TunnelSession>)> = self

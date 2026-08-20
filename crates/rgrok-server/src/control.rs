@@ -604,10 +604,18 @@ async fn handle_control_msg(
                     let tcp_tunnel = session.clone();
                     tokio::spawn(async move {
                         let result = crate::proxy::serve_tcp_tunnel_on_listener(
-                            tcp_state, listener, tcp_tunnel,
+                            tcp_state.clone(),
+                            listener,
+                            tcp_tunnel.clone(),
                         )
                         .await;
                         let _ = listener_stopped_tx.send(());
+                        if let Some(removed) =
+                            tcp_state.remove_tcp_tunnel_if_owner(port, &tcp_tunnel)
+                        {
+                            tcp_state.release_tcp_port_reservation(port, &removed.id);
+                            tcp_state.delete_dns_record(&removed).await;
+                        }
                         if let Err(e) = result {
                             warn!(port, "TCP tunnel listener error: {}", e);
                         }

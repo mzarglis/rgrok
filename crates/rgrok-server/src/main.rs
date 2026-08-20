@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
     let tls_config = match tls_source {
         tls::TlsSource::AcmeProvision => {
             info!("No existing TLS certs, attempting Cloudflare ACME provisioning");
-            tls::provision_wildcard_cert(&config).await?
+            tls::provision_wildcard_cert(&config)
+                .await
+                .context("failed to provision ACME wildcard certificate")?
         }
         _ => tls::load_tls_config(&config).context("failed to load TLS configuration")?,
     };
