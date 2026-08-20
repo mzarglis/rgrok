@@ -10,20 +10,90 @@ use crate::config::Config;
 use crate::dns::CloudflareClient;
 use crate::tunnel_manager::ServerState;
 
-/// Load TLS configuration: try files first, then ACME certs on disk, then self-signed for dev.
-pub fn load_tls_config(config: &Config) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    if let (Some(cert_file), Some(key_file)) = (&config.tls.cert_file, &config.tls.key_file) {
-        info!("Loading TLS certificates from files");
-        load_from_files(cert_file, key_file)
-    } else {
-        // Check if ACME-provisioned certs exist on disk
-        let cert_path = PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
-        let key_path = PathBuf::from(&config.tls.cert_dir).join("privkey.pem");
+/// The source of the certificate used by the server.
+///
+/// This is kept separate from the loaded rustls configuration so startup can
+/// decide whether a missing certificate is a development condition or an
+/// ACME provisioning condition before generating a self-signed certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsSource {
+    /// A certificate and key explicitly configured by the operator.
+    BringYourOwn,
+    /// A certificate previously provisioned by ACME and cached on disk.
+    CachedAcme,
+    /// No certificate is available yet; Cloudflare ACME must provision one.
+    AcmeProvision,
+    /// No production certificate source is configured (development mode).
+    SelfSigned,
+}
 
-        if cert_path.exists() && key_path.exists() {
+/// Whether Cloudflare DNS-01 credentials are configured for ACME.
+pub fn cloudflare_acme_configured(config: &Config) -> bool {
+    !config.cloudflare.api_token.is_empty() && !config.cloudflare.zone_id.is_empty()
+}
+
+/// Select the certificate source used at startup.
+pub fn select_tls_source(config: &Config) -> anyhow::Result<TlsSource> {
+    let byo_cert = config.tls.cert_file.is_some();
+    let byo_key = config.tls.key_file.is_some();
+    if byo_cert != byo_key {
+        anyhow::bail!("tls.cert_file and tls.key_file must be configured together");
+    }
+    if byo_cert {
+        return Ok(TlsSource::BringYourOwn);
+    }
+
+    let cert_path = PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
+    let key_path = PathBuf::from(&config.tls.cert_dir).join("privkey.pem");
+    match (cert_path.exists(), key_path.exists()) {
+        (true, true) => return Ok(TlsSource::CachedAcme),
+        (true, false) | (false, true) => {
+            anyhow::bail!(
+                "incomplete cached ACME certificate in {} (fullchain.pem and privkey.pem are both required)",
+                config.tls.cert_dir
+            );
+        }
+        (false, false) => {}
+    }
+
+    if cloudflare_acme_configured(config) {
+        Ok(TlsSource::AcmeProvision)
+    } else if config.cloudflare.api_token.is_empty() && config.cloudflare.zone_id.is_empty() {
+        Ok(TlsSource::SelfSigned)
+    } else {
+        anyhow::bail!("cloudflare.api_token and cloudflare.zone_id must be configured together");
+    }
+}
+
+/// Load TLS configuration from the selected on-disk source, or generate the
+/// development certificate. ACME provisioning is intentionally not performed
+/// here because it is asynchronous and must happen before listeners start.
+pub fn load_tls_config(config: &Config) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    match select_tls_source(config)? {
+        TlsSource::BringYourOwn => {
+            info!("Loading TLS certificates from files");
+            load_from_files(
+                config
+                    .tls
+                    .cert_file
+                    .as_deref()
+                    .expect("validated cert_file"),
+                config.tls.key_file.as_deref().expect("validated key_file"),
+            )
+        }
+        TlsSource::CachedAcme => {
             info!("Loading ACME certificates from {}", config.tls.cert_dir);
-            load_from_files(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
-        } else {
+            let cert_path = PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
+            let key_path = PathBuf::from(&config.tls.cert_dir).join("privkey.pem");
+            load_from_files(
+                cert_path.to_str().expect("certificate path is valid UTF-8"),
+                key_path.to_str().expect("key path is valid UTF-8"),
+            )
+        }
+        TlsSource::AcmeProvision => {
+            anyhow::bail!("no TLS certificate found; Cloudflare ACME provisioning is required")
+        }
+        TlsSource::SelfSigned => {
             info!("Generating self-signed certificate for development");
             generate_self_signed(&config.server.domain)
         }
@@ -40,15 +110,40 @@ pub fn load_tls_config(config: &Config) -> anyhow::Result<Arc<rustls::ServerConf
 /// 5. Download and save cert chain
 /// 6. Clean up TXT records
 pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    use instant_acme::{
-        Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-        OrderStatus,
-    };
-
     let cf = CloudflareClient::new(
         config.cloudflare.api_token.clone(),
         config.cloudflare.zone_id.clone(),
     );
+    let mut txt_record_ids = Vec::new();
+
+    let result = provision_wildcard_cert_inner(config, &cf, &mut txt_record_ids).await;
+    let cleanup_result = cf.delete_records(&txt_record_ids).await;
+
+    match (result, cleanup_result) {
+        (Ok(tls_config), Ok(())) => {
+            info!("ACME wildcard certificate provisioned successfully");
+            Ok(tls_config)
+        }
+        (Ok(tls_config), Err(cleanup_error)) => {
+            warn!(%cleanup_error, "ACME certificate provisioned, but TXT record cleanup failed");
+            Ok(tls_config)
+        }
+        (Err(primary_error), Ok(())) => Err(primary_error),
+        (Err(primary_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "{primary_error}; additionally, TXT record cleanup failed: {cleanup_error}"
+        )),
+    }
+}
+
+async fn provision_wildcard_cert_inner(
+    config: &Config,
+    cf: &CloudflareClient,
+    txt_record_ids: &mut Vec<String>,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use instant_acme::{
+        Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
+        OrderStatus,
+    };
 
     // 1. Create or restore ACME account
     let account_path = PathBuf::from(&config.tls.cert_dir).join("acme_account.json");
@@ -105,7 +200,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
         .map_err(|e| anyhow::anyhow!("ACME order: {}", e))?;
 
     // 3. Get authorizations and find DNS-01 challenges, create TXT records
-    let mut txt_record_ids: Vec<String> = Vec::new();
     let challenge_domain = format!("_acme-challenge.{}", config.server.domain);
 
     {
@@ -156,14 +250,11 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
             OrderStatus::Pending => {
                 attempts += 1;
                 if attempts > 30 {
-                    // Clean up TXT records before bailing
-                    let _ = cf.delete_txt_records(&challenge_domain).await;
                     anyhow::bail!("ACME order still pending after 150s");
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             OrderStatus::Invalid => {
-                let _ = cf.delete_txt_records(&challenge_domain).await;
                 anyhow::bail!("ACME order became invalid");
             }
             OrderStatus::Valid => {
@@ -171,7 +262,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
                 break;
             }
             status => {
-                let _ = cf.delete_txt_records(&challenge_domain).await;
                 anyhow::bail!("Unexpected ACME order status: {:?}", status);
             }
         }
@@ -207,13 +297,11 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
                 OrderStatus::Processing => {
                     finalize_attempts += 1;
                     if finalize_attempts > 20 {
-                        let _ = cf.delete_txt_records(&challenge_domain).await;
                         anyhow::bail!("ACME order still processing after finalize");
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 status => {
-                    let _ = cf.delete_txt_records(&challenge_domain).await;
                     anyhow::bail!("ACME order failed after finalize: {:?}", status);
                 }
             }
@@ -230,10 +318,6 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
     // 9. Save to disk
     let key_pem = private_key.serialize_pem();
     save_cert(&cert_pem, &key_pem, &config.tls.cert_dir)?;
-
-    // 10. Clean up TXT records
-    cf.delete_txt_records(&challenge_domain).await?;
-    info!("ACME wildcard certificate provisioned successfully");
 
     // Load the newly saved cert
     let cert_path = PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
@@ -322,9 +406,12 @@ pub async fn cert_renewal_loop(state: Arc<ServerState>) {
     loop {
         interval.tick().await;
 
-        // Check if Cloudflare is configured (needed for ACME DNS-01)
-        if state.config.cloudflare.api_token.is_empty()
-            || state.config.cloudflare.zone_id.is_empty()
+        // Only ACME-managed certificates should be renewed here. BYO
+        // certificates are owned by the operator and self-signed development
+        // certificates have no ACME account to renew them with.
+        if !cloudflare_acme_configured(&state.config)
+            || state.config.tls.cert_file.is_some()
+            || state.config.tls.key_file.is_some()
         {
             continue;
         }
@@ -384,4 +471,76 @@ fn cert_expires_within(cert_path: &PathBuf, threshold: Duration) -> anyhow::Resu
 
     let remaining = not_after - now;
     Ok(remaining < threshold.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(cert_dir: &str) -> Config {
+        let mut config = Config::default();
+        config.tls.cert_dir = cert_dir.to_string();
+        config.cloudflare.api_token.clear();
+        config.cloudflare.zone_id.clear();
+        config
+    }
+
+    fn temp_cert_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("rgrok-tls-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn missing_certificate_uses_self_signed_only_without_cloudflare() {
+        let cert_dir = temp_cert_dir();
+        let config = test_config(cert_dir.to_str().unwrap());
+
+        assert_eq!(select_tls_source(&config).unwrap(), TlsSource::SelfSigned);
+
+        let _ = std::fs::remove_dir_all(cert_dir);
+    }
+
+    #[test]
+    fn missing_certificate_requires_acme_when_cloudflare_is_configured() {
+        let cert_dir = temp_cert_dir();
+        let mut config = test_config(cert_dir.to_str().unwrap());
+        config.cloudflare.api_token = "api-token".to_string();
+        config.cloudflare.zone_id = "zone-id".to_string();
+
+        assert_eq!(
+            select_tls_source(&config).unwrap(),
+            TlsSource::AcmeProvision
+        );
+        let error = load_tls_config(&config).unwrap_err().to_string();
+        assert!(error.contains("ACME provisioning is required"), "{error}");
+
+        let _ = std::fs::remove_dir_all(cert_dir);
+    }
+
+    #[test]
+    fn cached_acme_certificate_is_selected_as_a_pair() {
+        let cert_dir = temp_cert_dir();
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::write(cert_dir.join("fullchain.pem"), b"placeholder").unwrap();
+        std::fs::write(cert_dir.join("privkey.pem"), b"placeholder").unwrap();
+
+        let config = test_config(cert_dir.to_str().unwrap());
+        assert_eq!(select_tls_source(&config).unwrap(), TlsSource::CachedAcme);
+
+        let _ = std::fs::remove_dir_all(cert_dir);
+    }
+
+    #[test]
+    fn incomplete_certificate_sources_are_rejected() {
+        let cert_dir = temp_cert_dir();
+        let mut config = test_config(cert_dir.to_str().unwrap());
+        config.tls.cert_file = Some("cert.pem".to_string());
+        assert!(select_tls_source(&config).is_err());
+
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::write(cert_dir.join("fullchain.pem"), b"placeholder").unwrap();
+        let config = test_config(cert_dir.to_str().unwrap());
+        assert!(select_tls_source(&config).is_err());
+
+        let _ = std::fs::remove_dir_all(cert_dir);
+    }
 }

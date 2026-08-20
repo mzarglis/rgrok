@@ -18,6 +18,8 @@ pub struct Metrics {
     pub bytes_in_total: IntCounter,
     pub bytes_out_total: IntCounter,
     pub ws_connections_active: IntGauge,
+    pub tcp_reservations_retained: IntGauge,
+    pub buffered_request_body_bytes: IntGauge,
     #[allow(dead_code)]
     pub tunnel_errors_total: IntCounterVec,
 }
@@ -73,6 +75,24 @@ impl Metrics {
             .register(Box::new(ws_connections_active.clone()))
             .unwrap();
 
+        let tcp_reservations_retained = IntGauge::new(
+            "rgrok_tcp_reservations_retained",
+            "TCP port reservations retained after listener shutdown timed out",
+        )
+        .expect("metric creation failed");
+        registry
+            .register(Box::new(tcp_reservations_retained.clone()))
+            .unwrap();
+
+        let buffered_request_body_bytes = IntGauge::new(
+            "rgrok_buffered_request_body_bytes",
+            "Bytes held in currently buffered public request bodies",
+        )
+        .expect("metric creation failed");
+        registry
+            .register(Box::new(buffered_request_body_bytes.clone()))
+            .unwrap();
+
         let tunnel_errors_total = IntCounterVec::new(
             Opts::new("rgrok_tunnel_errors_total", "Total tunnel errors by kind"),
             &["kind"],
@@ -90,6 +110,8 @@ impl Metrics {
             bytes_in_total,
             bytes_out_total,
             ws_connections_active,
+            tcp_reservations_retained,
+            buffered_request_body_bytes,
             tunnel_errors_total,
         }
     }

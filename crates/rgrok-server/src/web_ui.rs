@@ -1,18 +1,24 @@
+use std::cmp::Reverse;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::header::{self, HeaderMap, HeaderValue};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
-use axum::response::{Html, IntoResponse, Json};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::stream::Stream;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
 
 use rgrok_proto::inspect::CapturedRequest;
 
+use crate::auth;
 use crate::tunnel_manager::ServerState;
 
 /// Replay result returned to the client
@@ -23,13 +29,47 @@ struct ReplayResult {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
+#[derive(Clone)]
+struct UiSecurity {
+    auth_token: Option<String>,
+    csrf_token: String,
+    require_loopback_host: bool,
+}
+
+impl UiSecurity {
+    fn new(auth_token: Option<String>, require_loopback_host: bool) -> Self {
+        Self {
+            auth_token: auth_token.filter(|token| !token.trim().is_empty()),
+            csrf_token: uuid::Uuid::new_v4().to_string(),
+            require_loopback_host,
+        }
+    }
+}
+
 /// Serve the web inspection UI
 pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
     if state.config.inspect.ui_port == 0 {
         info!("Inspection UI disabled (ui_port = 0)");
         return Ok(());
     }
+    if !crate::config::is_loopback_bind(&state.config.inspect.ui_bind)
+        && state
+            .config
+            .inspect
+            .ui_auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .is_none()
+    {
+        anyhow::bail!("refusing non-loopback inspection UI without inspect.ui_auth_token");
+    }
 
+    let security = Arc::new(UiSecurity::new(
+        state.config.inspect.ui_auth_token.clone(),
+        crate::config::is_loopback_bind(&state.config.inspect.ui_bind),
+    ));
+    let middleware_security = security.clone();
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/api/requests", get(list_requests))
@@ -38,7 +78,11 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
         .route("/api/requests/{id}/replay", post(replay_request))
         .route("/api/stream", get(event_stream))
         .route("/api/status", get(server_status))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let security = middleware_security.clone();
+            async move { inspect_security(request, next, security).await }
+        }));
 
     let bind_addr = format!(
         "{}:{}",
@@ -50,6 +94,108 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn inspect_security(request: Request, next: Next, security: Arc<UiSecurity>) -> Response {
+    if security.require_loopback_host && !loopback_host_valid(request.headers()) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid inspection UI Host",
+        )
+            .into_response();
+    }
+
+    if let Some(token) = security.auth_token.as_deref() {
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| authorized_header(value, token))
+            .unwrap_or(false);
+        if !authorized {
+            return unauthorized_response();
+        }
+    }
+
+    if is_mutating(request.method()) && !csrf_header_valid(request.headers(), &security.csrf_token)
+    {
+        return (StatusCode::FORBIDDEN, "missing or invalid CSRF token").into_response();
+    }
+
+    let has_csrf_cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| cookie_value(value, "rgrok_csrf").is_some())
+        .unwrap_or(false);
+    let mut response = next.run(request).await;
+    if !has_csrf_cookie {
+        let cookie = format!(
+            "rgrok_csrf={}; Path=/; SameSite=Strict",
+            security.csrf_token
+        );
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+fn authorized_header(value: &str, token: &str) -> bool {
+    value
+        .strip_prefix("Bearer ")
+        .map(|candidate| tokens_equal(candidate, token))
+        .unwrap_or(false)
+        || auth::parse_basic_auth_header(value)
+            .map(|(user, password)| user == "rgrok" && tokens_equal(&password, token))
+            .unwrap_or(false)
+}
+
+fn tokens_equal(candidate: &str, expected: &str) -> bool {
+    let candidate = Sha256::digest(candidate.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    bool::from(candidate.ct_eq(&expected))
+}
+
+fn unauthorized_response() -> Response {
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"rgrok inspect\""),
+    );
+    response
+}
+
+fn is_mutating(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    )
+}
+
+fn csrf_header_valid(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("x-rgrok-csrf")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == expected)
+        .unwrap_or(false)
+}
+
+fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
+fn loopback_host_valid(headers: &HeaderMap) -> bool {
+    let Some(authority) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    rgrok_proto::inspect::is_loopback_authority(authority)
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -64,7 +210,7 @@ async fn list_requests(State(state): State<Arc<ServerState>>) -> Json<Vec<Captur
         all_requests.extend(queue.iter().cloned());
     }
 
-    all_requests.sort_by(|a, b| b.captured_at.cmp(&a.captured_at));
+    all_requests.sort_by_key(|request| Reverse(request.captured_at));
     Json(all_requests)
 }
 
@@ -89,7 +235,7 @@ async fn clear_requests(State(state): State<Arc<ServerState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn replay_request(
+pub(crate) async fn replay_request(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -111,48 +257,20 @@ async fn replay_request(
         None => return Err(StatusCode::NOT_FOUND),
     };
 
-    // Look up the tunnel session to find the local port target
-    // For server-side replay, we forward through the tunnel to the client's local service
-    let session = match tunnel_subdomain
-        .as_deref()
-        .and_then(|sub| state.tunnels.get(sub))
-    {
-        Some(s) => s.clone(),
-        None => return Err(StatusCode::BAD_GATEWAY),
-    };
+    let subdomain = tunnel_subdomain.ok_or(StatusCode::BAD_GATEWAY)?;
+    let new_id = uuid::Uuid::new_v4().to_string();
 
-    // Re-issue the HTTP request through the tunnel by sending a StreamOpen
-    // For simplicity, we record the replay intent and return success
-    // The actual replay goes through the normal proxy path
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://{}.{}{}",
-        session.subdomain, state.config.server.domain, cap.req_url
-    );
-    let method: reqwest::Method = cap.req_method.parse().unwrap_or(reqwest::Method::GET);
-    let mut req = client.request(method, &url);
+    // Route directly through the normal tunnel stream path. This avoids public DNS/TLS recursion
+    // and stores the completed response under the exact ID returned to the UI.
+    crate::proxy::replay_http_request(state, &subdomain, &cap, new_id.clone())
+        .await
+        .inspect_err(|&status| {
+            tracing::warn!(%status, "Replay failed through tunnel");
+        })?;
 
-    for (k, v) in &cap.req_headers {
-        if !k.eq_ignore_ascii_case("host") {
-            req = req.header(k.as_str(), v.as_str());
-        }
-    }
-    if let Some(body) = &cap.req_body {
-        req = req.body(body.clone());
-    }
-
-    match req.send().await {
-        Ok(_resp) => {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            Ok(Json(ReplayResult {
-                new_request_id: new_id,
-            }))
-        }
-        Err(e) => {
-            tracing::warn!("Replay failed: {}", e);
-            Err(StatusCode::BAD_GATEWAY)
-        }
-    }
+    Ok(Json(ReplayResult {
+        new_request_id: new_id,
+    }))
 }
 
 async fn event_stream(
@@ -180,4 +298,65 @@ async fn server_status(State(state): State<Arc<ServerState>>) -> Json<serde_json
         "tcp_tunnels": tcp_tunnels,
         "max_tunnels": state.config.server.max_tunnels,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_ui_auth_accepts_bearer_and_basic_credentials() {
+        let token = "ui-secret";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ui-secret"),
+        );
+        assert!(authorized_header(
+            headers
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            token
+        ));
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("rgrok:ui-secret");
+        assert!(authorized_header(&format!("Basic {encoded}"), token));
+        assert!(!authorized_header("Bearer wrong", token));
+    }
+
+    #[test]
+    fn mutations_require_csrf_header() {
+        let headers = HeaderMap::new();
+        assert!(!csrf_header_valid(&headers, "csrf"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rgrok-csrf", HeaderValue::from_static("csrf"));
+        assert!(csrf_header_valid(&headers, "csrf"));
+        assert!(is_mutating(&Method::POST));
+        assert!(!is_mutating(&Method::GET));
+    }
+
+    #[test]
+    fn loopback_ui_rejects_dns_rebinding_hosts() {
+        for host in ["localhost:4040", "127.0.0.1:4040", "[::1]:4040"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(loopback_host_valid(&headers));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:4040"),
+        );
+        assert!(!loopback_host_valid(&headers));
+    }
+
+    #[test]
+    fn dashboard_uses_dom_apis_instead_of_unsafe_interpolation() {
+        assert!(!INDEX_HTML.contains("innerHTML"));
+        assert!(!INDEX_HTML.contains("onclick="));
+        assert!(INDEX_HTML.contains("textContent"));
+    }
 }

@@ -9,7 +9,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+rust-version = "1.88"
+license = "AGPL-3.0-only"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 tokio          = { version = "1", features = ["full"] }
@@ -38,6 +40,7 @@ tokio-rustls   = "0.26"
 futures        = "0.3"
 bytes          = "1"
 http           = "1"
+http-body      = "1"
 hyper          = { version = "1", features = ["http1", "server", "client"] }
 hyper-util     = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
@@ -49,9 +52,10 @@ base64         = "0.22"
 crossterm      = "0.29"
 pin-project-lite = "0.2"
 tokio-stream     = { version = "0.1", features = ["sync"] }
-tokio-util       = { version = "0.7", features = ["compat"] }
+tokio-util       = { version = "0.7", features = ["compat", "codec"] }
 prometheus       = "0.14"
 x509-parser      = "0.16"
+subtle           = "2"
 
 [profile.release]
 strip = true

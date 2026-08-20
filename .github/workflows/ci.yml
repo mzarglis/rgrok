@@ -8,6 +8,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+permissions:
+  contents: read
+
 jobs:
   changes:
     name: Detect changes
@@ -16,6 +19,8 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -24,6 +29,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deploy/Dockerfile'
 
   check:
     name: Check
@@ -32,6 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
@@ -44,6 +52,29 @@ jobs:
     steps:
       - run: echo "No Rust changes, skipping"
 
+  metadata:
+    name: Metadata
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify MSRV and Docker builder stay aligned
+        shell: bash
+        run: |
+          msrv="$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[].rust_version]
+            | unique
+            | if length == 1 and .[0] != null
+              then .[0]
+              else error("all workspace packages must share one rust-version")
+              end
+          ')"
+          grep -Fx "FROM rust:${msrv}-bookworm AS builder" deploy/Dockerfile
+
   test:
     name: Test
     needs: changes
@@ -51,6 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
@@ -70,6 +103,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -91,6 +126,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -103,6 +140,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "No Rust changes, skipping"
+
+  license:
+    name: License metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify AGPL metadata and package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s LICENSE
+          grep -q '^[[:space:]]*GNU AFFERO GENERAL PUBLIC LICENSE[[:space:]]*$' LICENSE
+          grep -q '^[[:space:]]*Version 3, 19 November 2007[[:space:]]*$' LICENSE
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].license] | unique | join("\n")')" = "AGPL-3.0-only"
+          for package in rgrok-proto rgrok-server rgrok-client; do
+            cargo package --package "$package" --allow-dirty --no-verify --list | grep -qx 'LICENSE'
+          done
 
   pr-title:
     name: PR Title

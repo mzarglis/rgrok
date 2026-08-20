@@ -4,6 +4,8 @@
 [server]
 # Hostname of your VPS (used for TLS cert and DNS)
 domain = "tunnel.mysite.com"
+# Public IPv4 used for per-tunnel Cloudflare A records (required when enabled)
+# public_ip = "203.0.113.10"
 
 # Port the control WebSocket listens on (clients connect here)
 control_port = 7835
@@ -22,6 +24,12 @@ max_tunnels = 100
 
 # Maximum tunnel idle time before server closes it
 tunnel_idle_timeout_secs = 300
+
+# Hard limit for an HTTP request body accepted by the public proxy (bytes)
+max_request_body_bytes = 16777216
+
+# Hard limit for an HTTP response body read from a tunnel (bytes)
+max_response_body_bytes = 16777216
 
 [auth]
 # Secret for signing/verifying JWTs (generate with: openssl rand -hex 32)
@@ -65,6 +73,9 @@ per_tunnel_dns = false
 # Bind to 127.0.0.1 only when running on VPS
 ui_port = 0
 ui_bind = "127.0.0.1"
+# Optional HTTP Basic/Bearer token for the UI. Required when ui_bind is not
+# loopback (username "rgrok" when using the browser's Basic Auth prompt).
+# ui_auth_token = "change-this-to-a-long-random-value"
 
 # Max requests to keep in memory per tunnel
 buffer_size = 100
