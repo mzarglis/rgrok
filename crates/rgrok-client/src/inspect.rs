@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -155,7 +156,7 @@ async fn dashboard() -> Html<&'static str> {
 async fn list_requests(State(state): State<Arc<InspectState>>) -> Json<Vec<CapturedRequest>> {
     let queue = state.captures.lock().await;
     let mut requests: Vec<CapturedRequest> = queue.iter().cloned().collect();
-    requests.sort_by(|a, b| b.captured_at.cmp(&a.captured_at));
+    requests.sort_by_key(|request| Reverse(request.captured_at));
     Json(requests)
 }
 

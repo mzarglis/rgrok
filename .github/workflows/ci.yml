@@ -137,8 +137,8 @@ jobs:
         run: |
           set -euo pipefail
           test -s LICENSE
-          grep -q '^GNU AFFERO GENERAL PUBLIC LICENSE$' LICENSE
-          grep -q '^Version 3, 19 November 2007$' LICENSE
+          grep -q '^[[:space:]]*GNU AFFERO GENERAL PUBLIC LICENSE[[:space:]]*$' LICENSE
+          grep -q '^[[:space:]]*Version 3, 19 November 2007[[:space:]]*$' LICENSE
           test "$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].license] | unique | join("\n")')" = "AGPL-3.0-only"
           for package in rgrok-proto rgrok-server rgrok-client; do
             cargo package --package "$package" --allow-dirty --no-verify --list | grep -qx 'LICENSE'

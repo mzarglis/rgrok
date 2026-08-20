@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use axum::extract::{Path, Request, State};
@@ -201,7 +202,7 @@ async fn list_requests(State(state): State<Arc<ServerState>>) -> Json<Vec<Captur
         all_requests.extend(queue.iter().cloned());
     }
 
-    all_requests.sort_by(|a, b| b.captured_at.cmp(&a.captured_at));
+    all_requests.sort_by_key(|request| Reverse(request.captured_at));
     Json(all_requests)
 }
 
