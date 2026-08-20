@@ -190,9 +190,20 @@ The server performs hot-reload every 12 hours — if the cert on disk changes, i
 
 ## Docker Deployment
 
+The image does not contain a server configuration or a default JWT signing
+secret. Create `/etc/rgrok/server.toml` on the host, set `auth.secret` to a
+fresh value from `openssl rand -hex 32`, and mount that directory read-only.
+Starting the image without this file fails closed with an actionable error.
+
 ```bash
 # Build
 docker build -t rgrok-server -f deploy/Dockerfile .
+
+# Prepare an operator-managed config (edit domain, TLS, and other settings).
+sudo cp config/server.example.toml /etc/rgrok/server.toml
+openssl rand -hex 32  # put this output in /etc/rgrok/server.toml as auth.secret
+# The image runs as its non-root rgrok user; the bind-mounted file must be readable.
+sudo chmod 644 /etc/rgrok/server.toml
 
 # Run (mount your config and cert storage)
 docker run -d \

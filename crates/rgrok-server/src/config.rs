@@ -137,6 +137,11 @@ impl Config {
         if self.auth.secret.len() < 32 {
             anyhow::bail!("auth.secret must be at least 32 characters");
         }
+        if is_placeholder_secret(&self.auth.secret) {
+            anyhow::bail!(
+                "auth.secret must not be a placeholder; replace it with a randomly generated secret (for example, `openssl rand -hex 32`)"
+            );
+        }
         if self.server.domain.is_empty() {
             anyhow::bail!("server.domain must be set");
         }
@@ -145,6 +150,27 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Return whether a secret is one of the placeholder forms shipped in examples
+/// or commonly copied into a deployment. Matching markers rather than a single
+/// literal keeps validation effective when the explanatory suffix changes.
+fn is_placeholder_secret(secret: &str) -> bool {
+    let normalized = secret.trim().to_ascii_lowercase();
+    [
+        "changeme",
+        "change_me",
+        "change-me",
+        "generate_with",
+        "replace_with",
+        "your-secret",
+        "your_secret",
+        "<your",
+        "placeholder",
+        "example",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 impl Default for Config {
@@ -263,6 +289,37 @@ secret = "tooshort"
             "expected secret length error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_placeholder_secret_rejected() {
+        let toml_str = r#"
+[server]
+domain = "tunnel.example.com"
+
+[auth]
+secret = "CHANGEME_generate_with_openssl_rand_hex_32"
+
+[tls]
+[cloudflare]
+[inspect]
+[logging]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a placeholder"),
+            "expected placeholder secret error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_placeholder_detection_is_not_literal_only() {
+        assert!(is_placeholder_secret(
+            "CHANGEME_replace_with_a_secret_generated_for_this_host"
+        ));
+        assert!(!is_placeholder_secret("7d2c6b9e4f1a8c0e3b5d9f2a6c8e1b4d"));
     }
 
     #[test]
