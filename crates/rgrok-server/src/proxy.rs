@@ -6,7 +6,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, HOST};
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -17,6 +17,21 @@ use rgrok_proto::messages::ServerMsg;
 
 use crate::auth;
 use crate::tunnel_manager::{ServerState, TunnelSession};
+
+const MAX_RESPONSE_HEADERS: usize = 65_536;
+const READ_BUFFER_SIZE: usize = 8_192;
+
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// Serve the public HTTP proxy that routes requests to tunnels (port 80)
 /// All HTTP requests get a 301 redirect to HTTPS with HSTS.
@@ -208,10 +223,20 @@ async fn proxy_http_request(
     let inspect = tunnel.options.inspect;
     // captured after parts destructure
 
-    // Serialize the HTTP request into raw HTTP/1.1 and write into the yamux stream.
-    // The client will forward this to the local service as-is.
+    // Hyper has already decoded the public request body (including chunked bodies). Read it
+    // before serializing so the local service receives one unambiguous HTTP/1.1 framing mode.
     let (parts, body) = req.into_parts();
     let method_str_for_metrics: String = parts.method.to_string();
+
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Failed to read request body",
+            ));
+        }
+    };
 
     // Capture request metadata if inspection is enabled
     let capture_id = if inspect {
@@ -247,33 +272,15 @@ async fn proxy_http_request(
         None
     };
 
-    // Build request line + headers
-    let mut raw_request = format!(
-        "{} {} HTTP/1.1\r\n",
-        parts.method,
-        parts
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/")
+    // Build request line + headers. The raw tunnel is not an HTTP parser, so strip all
+    // hop-by-hop fields and replace any incoming Transfer-Encoding/Content-Length with the
+    // decoded body length. Connection tokens name additional hop-by-hop headers and are removed
+    // as well (RFC 9110 section 7.6.1).
+    let raw_request = serialize_http_request(
+        &parts,
+        body_bytes.len(),
+        tunnel.options.host_header.as_deref(),
     );
-
-    // Rewrite Host header if tunnel has a custom host_header option
-    let mut host_written = false;
-    if let Some(ref custom_host) = tunnel.options.host_header {
-        raw_request.push_str(&format!("Host: {}\r\n", custom_host));
-        host_written = true;
-    }
-
-    for (name, value) in &parts.headers {
-        if host_written && name == HOST {
-            continue; // Skip original Host header if we already wrote a custom one
-        }
-        if let Ok(v) = value.to_str() {
-            raw_request.push_str(&format!("{}: {}\r\n", name, v));
-        }
-    }
-    raw_request.push_str("\r\n");
 
     // Write headers into the proxy stream
     if proxy_stream
@@ -287,16 +294,6 @@ async fn proxy_http_request(
         ));
     }
 
-    // Stream the request body
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "Failed to read request body",
-            ));
-        }
-    };
     if !body_bytes.is_empty() && proxy_stream.write_all(&body_bytes).await.is_err() {
         return Ok(error_response(
             StatusCode::BAD_GATEWAY,
@@ -304,100 +301,55 @@ async fn proxy_http_request(
         ));
     }
 
-    // Read the HTTP response back from the proxy stream.
-    // We read in chunks and parse the response status + headers, then the body.
-    let mut response_buf = Vec::with_capacity(8192);
-    let mut temp = [0u8; 8192];
-
-    // Read until we have the full header section
-    loop {
-        let n = match proxy_stream.read(&mut temp).await {
-            Ok(n) => n,
-            Err(_) => {
-                return Ok(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Failed to read from tunnel",
-                ));
-            }
-        };
-        if n == 0 {
+    // Parse exactly one response. Content-Length and chunked responses complete without waiting
+    // for the local TCP connection to close; only a genuinely close-delimited response reads EOF.
+    let parsed_response = match read_http_response(&mut proxy_stream, &parts.method).await {
+        Ok(response) => response,
+        Err(_) => {
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
-                "Tunnel returned empty response",
+                "Invalid or incomplete response from tunnel",
             ));
         }
-        response_buf.extend_from_slice(&temp[..n]);
-
-        // Check if we have the full header section
-        if response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if response_buf.len() > 65536 {
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "Response headers too large",
-            ));
-        }
-    }
-
-    // Parse the response headers
-    let header_end = response_buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap()
-        + 4;
-
-    let header_str = String::from_utf8_lossy(&response_buf[..header_end]);
-
-    // Parse status line
-    let first_line = header_str
-        .lines()
-        .next()
-        .unwrap_or("HTTP/1.1 502 Bad Gateway");
-    let status_code = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(502);
+    };
+    let status_code = parsed_response.status_code;
+    let header_str = parsed_response.header_text;
+    let body_data = parsed_response.body;
+    let response_headers = parsed_response.headers;
+    let response_no_body = response_has_no_body(&parts.method, status_code);
 
     let mut builder = Response::builder().status(status_code);
 
-    // Parse response headers
-    for line in header_str.lines().skip(1) {
-        if line.is_empty() {
-            break;
+    // Forward end-to-end response fields only. The body was decoded above, so make the new
+    // response's framing explicit rather than retaining Transfer-Encoding/chunk markers.
+    let hop_by_hop = hop_by_hop_header_names(
+        response_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    let source_content_length = response_headers.iter().find_map(|(name, value)| {
+        (name.eq_ignore_ascii_case("content-length")).then_some(value.as_str())
+    });
+    for (name, value) in &response_headers {
+        if is_hop_by_hop(name, &hop_by_hop) || name.eq_ignore_ascii_case("content-length") {
+            continue;
         }
-        if let Some((name, value)) = line.split_once(": ") {
-            // Skip hop-by-hop headers
-            let name_lower = name.to_lowercase();
-            if name_lower == "transfer-encoding" || name_lower == "connection" {
-                continue;
-            }
-            builder = builder.header(name, value);
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if parts.method == Method::HEAD {
+        if let Some(content_length) = source_content_length {
+            builder = builder.header("Content-Length", content_length);
         }
+    } else if response_no_body {
+        builder = builder.header("Content-Length", "0");
+    } else {
+        builder = builder.header("Content-Length", body_data.len().to_string());
     }
 
     // Inject HSTS and any configured response headers
     builder = builder.header("Strict-Transport-Security", "max-age=31536000");
     for (name, value) in &tunnel.options.response_header {
         builder = builder.header(name.as_str(), value.as_str());
-    }
-
-    // Collect body: what we already have past the header section + remaining data
-    let mut body_data = response_buf[header_end..].to_vec();
-
-    // Read remaining body data from the stream
-    loop {
-        let n = match tokio::time::timeout(Duration::from_secs(30), proxy_stream.read(&mut temp))
-            .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) | Err(_) => break,
-        };
-        if n == 0 {
-            break;
-        }
-        body_data.extend_from_slice(&temp[..n]);
     }
 
     // Capture response metadata if inspection is enabled
@@ -462,7 +414,7 @@ async fn proxy_http_request(
     state
         .metrics
         .bytes_in_total
-        .inc_by(raw_request.len() as u64);
+        .inc_by((raw_request.len() + body_bytes.len()) as u64);
     state.metrics.bytes_out_total.inc_by(body_data.len() as u64);
 
     let response = builder
@@ -472,6 +424,339 @@ async fn proxy_http_request(
         });
 
     Ok(response)
+}
+
+#[derive(Debug)]
+struct ParsedHttpResponse {
+    status_code: u16,
+    headers: Vec<(String, String)>,
+    header_text: String,
+    body: Vec<u8>,
+}
+
+/// Read and de-frame one HTTP/1.1 response from the raw local-service stream.
+///
+/// The public Hyper server cannot consume a response body until its framing is known. In
+/// particular, a keep-alive local service must not force this function to wait for EOF after a
+/// Content-Length or chunked response. The returned body is always decoded bytes.
+async fn read_http_response<S>(
+    stream: &mut S,
+    request_method: &Method,
+) -> anyhow::Result<ParsedHttpResponse>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffered = Vec::with_capacity(READ_BUFFER_SIZE);
+    let (status_code, headers, header_text) = loop {
+        let header_end = read_header_section(stream, &mut buffered).await?;
+        let header_bytes = buffered[..header_end].to_vec();
+        let header_text = std::str::from_utf8(&header_bytes)?.to_string();
+        let (status_code, headers) = parse_response_headers(&header_text)?;
+        buffered.drain(..header_end);
+
+        // Informational responses (for example, 100 Continue) do not terminate the response.
+        // Keep parsing until the final response, while 101 Switching Protocols is terminal for
+        // HTTP/1.1 framing and is treated as a no-body response below.
+        if (100..200).contains(&status_code) && status_code != 101 {
+            continue;
+        }
+        break (status_code, headers, header_text);
+    };
+
+    if response_has_no_body(request_method, status_code) {
+        return Ok(ParsedHttpResponse {
+            status_code,
+            headers,
+            header_text,
+            body: Vec::new(),
+        });
+    }
+
+    let transfer_encoding = header_values(&headers, "transfer-encoding");
+    let chunked = transfer_encoding
+        .iter()
+        .flat_map(|value| value.split(','))
+        .last()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("chunked"));
+
+    let body = if chunked {
+        read_chunked_body(stream, &mut buffered).await?
+    } else if let Some(content_length) = parse_content_length(&headers)? {
+        read_fixed_body(stream, &mut buffered, content_length).await?
+    } else {
+        read_close_delimited_body(stream, &mut buffered).await?
+    };
+
+    Ok(ParsedHttpResponse {
+        status_code,
+        headers,
+        header_text,
+        body,
+    })
+}
+
+async fn read_header_section<S>(stream: &mut S, buffered: &mut Vec<u8>) -> anyhow::Result<usize>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut temp = [0u8; READ_BUFFER_SIZE];
+    loop {
+        if let Some(position) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+            return Ok(position + 4);
+        }
+        if buffered.len() >= MAX_RESPONSE_HEADERS {
+            anyhow::bail!("response headers too large");
+        }
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            anyhow::bail!("response ended before headers");
+        }
+        buffered.extend_from_slice(&temp[..n]);
+    }
+}
+
+fn parse_response_headers(header_text: &str) -> anyhow::Result<(u16, Vec<(String, String)>)> {
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing status line"))?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts.next().unwrap_or_default();
+    if !version.starts_with("HTTP/") {
+        anyhow::bail!("invalid HTTP status line");
+    }
+    let status_code = status_parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing response status"))?
+        .parse::<u16>()?;
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid response header"))?;
+        if name.trim().is_empty() {
+            anyhow::bail!("empty response header name");
+        }
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Ok((status_code, headers))
+}
+
+fn header_values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    headers
+        .iter()
+        .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+fn parse_content_length(headers: &[(String, String)]) -> anyhow::Result<Option<usize>> {
+    let mut parsed = None;
+    for value in header_values(headers, "content-length") {
+        for item in value.split(',') {
+            let length = item.trim().parse::<usize>()?;
+            if let Some(previous) = parsed {
+                if previous != length {
+                    anyhow::bail!("conflicting Content-Length values");
+                }
+            } else {
+                parsed = Some(length);
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+async fn ensure_buffered<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    required: usize,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut temp = [0u8; READ_BUFFER_SIZE];
+    while buffered.len() < required {
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            anyhow::bail!("response ended before body completed");
+        }
+        buffered.extend_from_slice(&temp[..n]);
+    }
+    Ok(())
+}
+
+fn take_buffered(buffered: &mut Vec<u8>, length: usize) -> Vec<u8> {
+    let length = length.min(buffered.len());
+    buffered.drain(..length).collect()
+}
+
+async fn read_fixed_body<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    content_length: usize,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = Vec::with_capacity(content_length.min(READ_BUFFER_SIZE * 2));
+    body.extend(take_buffered(buffered, content_length));
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        let mut temp = vec![0u8; remaining.min(READ_BUFFER_SIZE)];
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            anyhow::bail!("response ended before Content-Length bytes were read");
+        }
+        body.extend_from_slice(&temp[..n]);
+    }
+    Ok(body)
+}
+
+async fn read_line_crlf<S>(stream: &mut S, buffered: &mut Vec<u8>) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        if let Some(position) = buffered.windows(2).position(|window| window == b"\r\n") {
+            let line = buffered.drain(..position).collect::<Vec<_>>();
+            buffered.drain(..2);
+            return Ok(line);
+        }
+        if buffered.len() > MAX_RESPONSE_HEADERS {
+            anyhow::bail!("response chunk line too large");
+        }
+        ensure_buffered(stream, buffered, buffered.len() + 1).await?;
+    }
+}
+
+async fn read_chunked_body<S>(stream: &mut S, buffered: &mut Vec<u8>) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+    loop {
+        let line = read_line_crlf(stream, buffered).await?;
+        let size_text = line
+            .split(|byte| *byte == b';')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing chunk size"))?;
+        let size_text = std::str::from_utf8(size_text)?.trim();
+        let size = usize::from_str_radix(size_text, 16)?;
+        if size == 0 {
+            // Consume optional trailers. Their fields are hop-by-hop and are not exposed by the
+            // current proxy response type, but they must be consumed to complete the framing.
+            loop {
+                if read_line_crlf(stream, buffered).await?.is_empty() {
+                    break;
+                }
+            }
+            return Ok(body);
+        }
+
+        ensure_buffered(stream, buffered, size).await?;
+        body.extend(take_buffered(buffered, size));
+        ensure_buffered(stream, buffered, 2).await?;
+        if take_buffered(buffered, 2).as_slice() != b"\r\n" {
+            anyhow::bail!("missing CRLF after response chunk");
+        }
+    }
+}
+
+async fn read_close_delimited_body<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = std::mem::take(buffered);
+    let mut temp = [0u8; READ_BUFFER_SIZE];
+    loop {
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            return Ok(body);
+        }
+        body.extend_from_slice(&temp[..n]);
+    }
+}
+
+fn response_has_no_body(method: &Method, status_code: u16) -> bool {
+    *method == Method::HEAD
+        || (100..200).contains(&status_code)
+        || status_code == StatusCode::NO_CONTENT.as_u16()
+        || status_code == StatusCode::NOT_MODIFIED.as_u16()
+}
+
+fn hop_by_hop_header_names<'a>(
+    headers: impl Iterator<Item = (&'a str, &'a str)>,
+) -> std::collections::HashSet<String> {
+    let mut names = HOP_BY_HOP_HEADERS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<std::collections::HashSet<_>>();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("connection") {
+            names.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
+        }
+    }
+    names
+}
+
+fn serialize_http_request(
+    parts: &http::request::Parts,
+    body_length: usize,
+    custom_host: Option<&str>,
+) -> String {
+    let mut raw_request = format!(
+        "{} {} HTTP/1.1\r\n",
+        parts.method,
+        parts
+            .uri
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/")
+    );
+
+    let host_written = if let Some(custom_host) = custom_host {
+        raw_request.push_str(&format!("Host: {custom_host}\r\n"));
+        true
+    } else {
+        false
+    };
+    let hop_by_hop = hop_by_hop_header_names(
+        parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or(""))),
+    );
+    for (name, value) in &parts.headers {
+        if host_written && name == HOST {
+            continue;
+        }
+        if is_hop_by_hop(name.as_str(), &hop_by_hop) || name == http::header::CONTENT_LENGTH {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            raw_request.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    raw_request.push_str(&format!("Content-Length: {body_length}\r\n\r\n"));
+    raw_request
+}
+
+fn is_hop_by_hop(name: &str, hop_by_hop: &std::collections::HashSet<String>) -> bool {
+    hop_by_hop.contains(&name.to_ascii_lowercase())
 }
 
 /// Handle a single incoming HTTP connection (port 80) — 301 redirect to HTTPS
@@ -678,6 +963,113 @@ mod tests {
     fn test_extract_request_path_with_query() {
         let raw = "GET /foo?bar=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(extract_request_path(raw), "/foo?bar=1");
+    }
+
+    #[tokio::test]
+    async fn content_length_response_finishes_on_keepalive() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello",
+        )
+        .await
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_http_response(&mut stream, &Method::GET),
+        )
+        .await
+        .expect("Content-Length response should not wait for EOF")
+        .unwrap();
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn chunked_response_is_decoded_and_trailers_consumed() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice())
+            .await
+            .unwrap();
+        peer.write_all(b"5\r\nhello\r\n6;note=yes\r\n world\r\n0\r\nX-Trailer: done\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = read_http_response(&mut stream, &Method::GET).await.unwrap();
+        assert_eq!(response.body, b"hello world");
+        assert_eq!(
+            response.headers[0],
+            ("Transfer-Encoding".to_string(), "chunked".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn informational_response_is_skipped_before_final_response() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .await
+        .unwrap();
+
+        let response = read_http_response(&mut stream, &Method::POST)
+            .await
+            .unwrap();
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn head_and_no_content_responses_have_no_body() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+        let response = read_http_response(&mut stream, &Method::HEAD)
+            .await
+            .unwrap();
+        assert!(response.body.is_empty());
+
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_http_response(&mut stream, &Method::GET).await.unwrap();
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn connection_tokens_are_removed_with_standard_hop_by_hop_fields() {
+        let headers = [
+            ("Connection", "keep-alive, X-Local-Hop"),
+            ("X-Local-Hop", "remove me"),
+            ("X-End-To-End", "keep me"),
+        ];
+        let hop_by_hop = hop_by_hop_header_names(headers.into_iter());
+        assert!(hop_by_hop.contains("connection"));
+        assert!(hop_by_hop.contains("x-local-hop"));
+        assert!(hop_by_hop.contains("transfer-encoding"));
+        assert!(!hop_by_hop.contains("x-end-to-end"));
+    }
+
+    #[test]
+    fn serialized_request_uses_decoded_content_length() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(HOST, "example.com")
+            .header("Transfer-Encoding", "chunked")
+            .header("Connection", "X-Local-Hop")
+            .header("X-Local-Hop", "remove me")
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+
+        let serialized = serialize_http_request(&parts, 11, None);
+        assert!(serialized.starts_with("POST /submit HTTP/1.1\r\n"));
+        assert!(serialized.contains("Content-Length: 11\r\n"));
+        assert!(!serialized.contains("Transfer-Encoding"));
+        assert!(!serialized.contains("X-Local-Hop"));
     }
 
     // ── body truncation logic ──
