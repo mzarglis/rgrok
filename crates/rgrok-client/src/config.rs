@@ -260,35 +260,4 @@ format = "compact"
         assert_eq!(config.logging.level, "trace");
         assert_eq!(config.logging.format, "compact");
     }
-
-    // Auth parsing tests — replicate the logic from main.rs's parse_auth_arg
-    // since that function is not public/importable from here.
-    fn parse_auth(auth: &str) -> Option<(String, String)> {
-        let (user, pass) = auth.split_once(':')?;
-        Some((user.to_string(), pass.to_string()))
-    }
-
-    #[test]
-    fn test_parse_auth_valid() {
-        let result = parse_auth("user:pass");
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_parse_auth_no_colon() {
-        let result = parse_auth("nocolon");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_auth_empty_password() {
-        let result = parse_auth("user:");
-        assert_eq!(result, Some(("user".to_string(), "".to_string())));
-    }
-
-    #[test]
-    fn test_parse_auth_multiple_colons() {
-        let result = parse_auth("user:pass:extra");
-        assert_eq!(result, Some(("user".to_string(), "pass:extra".to_string())));
-    }
 }

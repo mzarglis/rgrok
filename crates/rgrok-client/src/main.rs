@@ -35,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
             inspect_port,
         } => {
             init_tracing(&config);
-            let basic_auth = auth.as_deref().and_then(parse_auth_arg);
             let options = rgrok_proto::TunnelOptions {
                 host_header,
                 inspect: !no_inspect && config.defaults.inspect,
@@ -45,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
                 local_port: port,
                 tunnel_type: rgrok_proto::TunnelType::Http,
                 subdomain,
-                basic_auth,
+                basic_auth: auth,
                 options,
                 inspect_port: if no_inspect { 0 } else { inspect_port },
             };
@@ -57,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
             auth,
         } => {
             init_tracing(&config);
-            let basic_auth = auth.as_deref().and_then(parse_auth_arg);
             let options = rgrok_proto::TunnelOptions {
                 host_header: None,
                 inspect: config.defaults.inspect,
@@ -67,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
                 local_port: port,
                 tunnel_type: rgrok_proto::TunnelType::Https,
                 subdomain,
-                basic_auth,
+                basic_auth: auth,
                 options,
                 inspect_port: config.defaults.inspect_port,
             };
@@ -186,14 +184,6 @@ fn parse_server_port(port: &str, server: &str) -> anyhow::Result<u16> {
             port,
             server
         )
-    })
-}
-
-fn parse_auth_arg(auth: &str) -> Option<rgrok_proto::BasicAuthConfig> {
-    let (user, pass) = auth.split_once(':')?;
-    Some(rgrok_proto::BasicAuthConfig {
-        username: user.to_string(),
-        password: pass.to_string(),
     })
 }
 

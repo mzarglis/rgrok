@@ -70,7 +70,7 @@ rgrok https 3000                       # HTTPS (server terminates TLS, local get
 rgrok tcp 22                           # Raw TCP tunnel (e.g. SSH)
 
 rgrok http 3000 --subdomain myapp      # Request a specific subdomain
-rgrok http 3000 --auth user:pass       # Protect with basic auth
+rgrok http 3000 --auth user:pass       # Protect with basic auth (password may contain ':')
 rgrok http 3000 --no-inspect           # Disable request capture
 rgrok http 3000 --server host:7835     # Connect to a specific (TLS) server
 rgrok --server ws://127.0.0.1:7835 --insecure http 3000  # Local dev only

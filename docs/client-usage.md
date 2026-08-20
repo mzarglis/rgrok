@@ -65,7 +65,7 @@ rgrok http 3000
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--subdomain <name>` | Request a specific subdomain | Random |
-| `--auth <user:pass>` | Require HTTP basic auth on the tunnel | None |
+| `--auth <USER:PASSWORD>` | Require HTTP basic auth on the tunnel (password may contain `:`) | None |
 | `--host-header <host>` | Rewrite the `Host` header sent to your local server | Unchanged |
 | `--no-inspect` | Disable request capture (lower memory usage) | Inspect on |
 | `--inspect-port <port>` | Port for the local inspection web UI | `4040` |
@@ -84,6 +84,9 @@ rgrok http 3000 --host-header localhost:3000
 # Disable inspection
 rgrok http 3000 --no-inspect
 ```
+
+The username and password must both be non-empty. If the password contains a
+colon, everything after the first colon is treated as the password.
 
 ---
 
