@@ -35,6 +35,9 @@ Example config file:
 [server]
 host = "tunnel.example.com"
 port = 7835
+# Production default: wss:// with certificate and hostname verification.
+# Set true only when connecting to a local development server over ws://.
+insecure = false
 
 [auth]
 token = "eyJ..."
@@ -143,13 +146,21 @@ These flags apply to all commands:
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--config <path>` | Path to config file | `~/.config/rgrok/config.toml` |
-| `--server <host:port>` | Override server address for this invocation | From config |
+| `--server <host:port>` | Override server address for this invocation; accepts `ws://` or `wss://` to select transport | From config |
+| `--insecure` | Use plaintext `ws://` for local development; the auth token is sent unencrypted | Off |
 
 **Example:**
 ```bash
 # One-off tunnel to a different server without editing config
 rgrok --server other-server.example.com:7835 http 3000
+
+# Local development only: explicitly opt in to plaintext control transport
+rgrok --server ws://127.0.0.1:7835 --insecure http 3000
 ```
+
+The client uses `wss://` and verifies the server certificate and hostname by
+default. Do not use `--insecure` or `server.insecure = true` for production
+servers: the authentication token is transmitted over plaintext WebSocket.
 
 ---
 

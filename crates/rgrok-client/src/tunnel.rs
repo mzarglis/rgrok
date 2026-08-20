@@ -31,8 +31,12 @@ pub async fn run(config: ClientConfig, tunnel_cfg: TunnelConfig) -> anyhow::Resu
         anyhow::bail!("No auth token configured. Run: rgrok authtoken <your-token>");
     }
 
-    // Use wss:// by default, fall back to ws:// if no TLS
-    let server_url = format!("ws://{}:{}/tunnel", config.server.host, config.server.port);
+    let server_url = server_websocket_url(&config)?;
+    if config.server.insecure {
+        warn!(
+            "INSECURE control transport enabled; the auth token will be sent over plaintext ws://"
+        );
+    }
 
     // Connect with exponential backoff
     let ws = connect_with_retry(&server_url).await?;
@@ -189,6 +193,34 @@ pub async fn run(config: ClientConfig, tunnel_cfg: TunnelConfig) -> anyhow::Resu
     Ok(())
 }
 
+/// Build the control WebSocket URL. TLS is deliberately the default: auth is
+/// sent immediately after the WebSocket handshake, so a plaintext fallback
+/// would expose the token to anyone able to observe the connection.
+fn server_websocket_url(config: &ClientConfig) -> anyhow::Result<String> {
+    if config.server.host.is_empty()
+        || config.server.host.contains("://")
+        || config.server.host.contains('/')
+        || config.server.host.contains('?')
+        || config.server.host.contains('#')
+    {
+        anyhow::bail!(
+            "Invalid server host '{}'; configure a hostname or IP address without a URL scheme",
+            config.server.host
+        );
+    }
+
+    let host = if config.server.host.contains(':') && !config.server.host.starts_with('[') {
+        format!("[{}]", config.server.host)
+    } else {
+        config.server.host.clone()
+    };
+    let scheme = if config.server.insecure { "ws" } else { "wss" };
+    Ok(format!(
+        "{}://{}:{}/tunnel",
+        scheme, host, config.server.port
+    ))
+}
+
 /// Open a yamux stream for proxying, write the correlation_id header,
 /// connect to localhost, and bridge bidirectionally.
 async fn open_proxy_stream(
@@ -279,8 +311,42 @@ async fn connect_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientConfig;
     use futures::AsyncReadExt as _;
     use tokio_util::compat::TokioAsyncReadCompatExt as _;
+
+    #[test]
+    fn test_server_websocket_url_defaults_to_tls() {
+        let config = ClientConfig::default();
+
+        assert_eq!(
+            server_websocket_url(&config).unwrap(),
+            "wss://tunnel.example.com:7835/tunnel"
+        );
+    }
+
+    #[test]
+    fn test_server_websocket_url_requires_explicit_insecure_mode() {
+        let mut config = ClientConfig::default();
+        config.server.host = "127.0.0.1".to_string();
+        config.server.insecure = true;
+
+        assert_eq!(
+            server_websocket_url(&config).unwrap(),
+            "ws://127.0.0.1:7835/tunnel"
+        );
+    }
+
+    #[test]
+    fn test_server_websocket_url_brackets_ipv6_hosts() {
+        let mut config = ClientConfig::default();
+        config.server.host = "::1".to_string();
+
+        assert_eq!(
+            server_websocket_url(&config).unwrap(),
+            "wss://[::1]:7835/tunnel"
+        );
+    }
 
     /// Stream Correlation: verify that when `open_proxy_stream` is called with a given
     /// `correlation_id`, the first 4 bytes it writes on the new yamux data stream are

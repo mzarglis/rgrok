@@ -17,6 +17,12 @@ pub struct ServerSection {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Use an unencrypted WebSocket control connection.
+    ///
+    /// This is intended for local development only. Production connections
+    /// use `wss://` by default so the auth token is not sent in plaintext.
+    #[serde(default)]
+    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +124,7 @@ impl Default for ClientConfig {
             server: ServerSection {
                 host: "tunnel.example.com".to_string(),
                 port: default_port(),
+                insecure: false,
             },
             auth: AuthSection {
                 token: String::new(),
@@ -165,6 +172,7 @@ mod tests {
             server: ServerSection {
                 host: "my.server.io".to_string(),
                 port: 9999,
+                insecure: false,
             },
             auth: AuthSection {
                 token: "tok_abc123".to_string(),
@@ -185,6 +193,7 @@ mod tests {
 
         assert_eq!(deserialized.server.host, "my.server.io");
         assert_eq!(deserialized.server.port, 9999);
+        assert!(!deserialized.server.insecure);
         assert_eq!(deserialized.auth.token, "tok_abc123");
         assert_eq!(deserialized.defaults.inspect_port, 5050);
         assert!(!deserialized.defaults.inspect);
@@ -207,6 +216,7 @@ token = ""
         assert_eq!(config.server.host, "partial.example.com");
         // port should fall back to default
         assert_eq!(config.server.port, 7835);
+        assert!(!config.server.insecure);
         // defaults section is missing from TOML, so serde uses
         // DefaultsSection's derive(Default) (Rust Default: 0/false),
         // NOT the per-field serde default functions.
@@ -224,6 +234,7 @@ token = ""
 [server]
 host = "custom.host.dev"
 port = 1234
+insecure = true
 
 [auth]
 token = "secret-token"
@@ -241,6 +252,7 @@ format = "compact"
 
         assert_eq!(config.server.host, "custom.host.dev");
         assert_eq!(config.server.port, 1234);
+        assert!(config.server.insecure);
         assert_eq!(config.auth.token, "secret-token");
         assert_eq!(config.defaults.inspect_port, 8080);
         assert!(!config.defaults.inspect);

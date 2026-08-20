@@ -6,6 +6,9 @@
 # Address of your rgrok server
 host = "tunnel.mysite.com"
 port = 7835
+# Keep the control channel encrypted in production. Set true only for a local
+# development server that intentionally listens on plaintext ws://.
+insecure = false
 
 [auth]
 # Your auth token (set via `rgrok authtoken <token>`)

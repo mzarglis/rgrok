@@ -13,6 +13,10 @@ pub struct Cli {
     #[arg(long)]
     pub server: Option<String>,
 
+    /// Use an unencrypted ws:// control connection (development only)
+    #[arg(long, global = true)]
+    pub insecure: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
