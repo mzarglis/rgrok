@@ -70,6 +70,9 @@ where
     if let Some(mut cap) =
         parse_request_for_capture(request_capture.as_slice(), inspect.max_body_bytes)
     {
+        cap.req_body_truncated = find_body_offset(request_capture.as_slice())
+            .map(|offset| bytes_in.saturating_sub(offset as u64) > inspect.max_body_bytes as u64)
+            .unwrap_or(false);
         let resp_data = response_capture.as_slice();
         if !resp_data.is_empty() {
             cap.resp_status = parse_response_status(resp_data);
@@ -187,6 +190,7 @@ fn parse_request_for_capture(data: &[u8], max_body_bytes: usize) -> Option<Captu
         req_url: url,
         req_headers: rgrok_proto::inspect::sanitize_headers(&headers),
         req_body: body,
+        req_body_truncated: false,
         resp_status: None,
         resp_headers: None,
         resp_body: None,

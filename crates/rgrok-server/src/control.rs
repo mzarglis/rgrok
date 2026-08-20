@@ -15,6 +15,21 @@ use rgrok_proto::{
 use crate::auth;
 use crate::tunnel_manager::{ConnectionStreamState, ServerState, TunnelSession};
 
+struct ActiveWebSocketGuard(prometheus::IntGauge);
+
+impl ActiveWebSocketGuard {
+    fn new(gauge: &prometheus::IntGauge) -> Self {
+        gauge.inc();
+        Self(gauge.clone())
+    }
+}
+
+impl Drop for ActiveWebSocketGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
 /// Start the control plane listener.
 pub async fn serve(
     state: Arc<ServerState>,
@@ -95,7 +110,7 @@ async fn handle_client<S>(ws: tokio_tungstenite::WebSocketStream<S>, state: Arc<
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    state.metrics.ws_connections_active.inc();
+    let _active_connection = ActiveWebSocketGuard::new(&state.metrics.ws_connections_active);
 
     let ws_compat = WsCompat::new(ws);
     let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Server);
@@ -326,7 +341,6 @@ where
     }
     accept_handle.abort();
     driver_handle.abort();
-    state.metrics.ws_connections_active.dec();
 }
 
 /// Handle a proxy data stream: read its correlation ID and resolve only the
@@ -592,7 +606,12 @@ async fn handle_control_msg(
                 .send(ServerMsg::TunnelAck {
                     id,
                     public_url,
-                    tunnel_type,
+                    tunnel_type: match tunnel_type {
+                        TunnelType::Tcp { .. } => TunnelType::Tcp {
+                            remote_port: tcp_port,
+                        },
+                        other => other,
+                    },
                 })
                 .await;
         }
@@ -714,7 +733,7 @@ mod tests {
         config
     }
 
-    async fn request_tcp(state: &Arc<ServerState>, id: &str, port: u16) -> ServerMsg {
+    async fn request_tcp(state: &Arc<ServerState>, id: &str, port: Option<u16>) -> ServerMsg {
         let (control_tx, mut control_rx) = mpsc::channel(4);
         let stream_state = Arc::new(ConnectionStreamState::new());
         let mut registered_subdomains = Vec::new();
@@ -722,9 +741,7 @@ mod tests {
         handle_control_msg(
             ClientMsg::TunnelRequest {
                 id: id.to_string(),
-                tunnel_type: TunnelType::Tcp {
-                    remote_port: Some(port),
-                },
+                tunnel_type: TunnelType::Tcp { remote_port: port },
                 subdomain: None,
                 basic_auth: None,
                 options: TunnelOptions::default(),
@@ -761,10 +778,10 @@ mod tests {
         let state = Arc::new(ServerState::new(tcp_config(port)));
 
         assert!(matches!(
-            request_tcp(&state, "first", port).await,
+            request_tcp(&state, "first", Some(port)).await,
             ServerMsg::TunnelAck { .. }
         ));
-        let second = request_tcp(&state, "second", port).await;
+        let second = request_tcp(&state, "second", Some(port)).await;
         assert!(matches!(second, ServerMsg::Error { code: 409, .. }));
         assert_eq!(state.tcp_tunnels.get(&port).unwrap().id, "first");
 
@@ -778,7 +795,7 @@ mod tests {
         assert!(port < u16::MAX);
         let state = Arc::new(ServerState::new(tcp_config(port)));
 
-        let response = request_tcp(&state, "bind-failure", port).await;
+        let response = request_tcp(&state, "bind-failure", Some(port)).await;
         match response {
             ServerMsg::Error { code, message } => {
                 assert_eq!(code, 500);
@@ -790,7 +807,7 @@ mod tests {
 
         drop(held);
         assert!(matches!(
-            request_tcp(&state, "after-bind-failure", port).await,
+            request_tcp(&state, "after-bind-failure", Some(port)).await,
             ServerMsg::TunnelAck { .. }
         ));
         remove_tcp_and_wait(&state, port).await;
@@ -805,7 +822,7 @@ mod tests {
         let state = Arc::new(ServerState::new(tcp_config(port)));
 
         assert!(matches!(
-            request_tcp(&state, "disconnect", port).await,
+            request_tcp(&state, "disconnect", Some(port)).await,
             ServerMsg::TunnelAck { .. }
         ));
         remove_tcp_and_wait(&state, port).await;
@@ -813,8 +830,29 @@ mod tests {
         // The old accept loop has stopped and dropped its socket, so the same
         // explicit port can be bound and acknowledged immediately.
         assert!(matches!(
-            request_tcp(&state, "reuse", port).await,
+            request_tcp(&state, "reuse", Some(port)).await,
             ServerMsg::TunnelAck { .. }
+        ));
+        remove_tcp_and_wait(&state, port).await;
+    }
+
+    #[tokio::test]
+    async fn random_tcp_ack_reports_the_assigned_port() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(port < u16::MAX);
+        let state = Arc::new(ServerState::new(tcp_config(port)));
+
+        let response = request_tcp(&state, "random", None).await;
+        assert!(matches!(
+            response,
+            ServerMsg::TunnelAck {
+                tunnel_type: TunnelType::Tcp {
+                    remote_port: Some(assigned)
+                },
+                ..
+            } if assigned == port
         ));
         remove_tcp_and_wait(&state, port).await;
     }

@@ -820,6 +820,7 @@ mod tests {
                         ("Content-Length".to_string(), "12".to_string()),
                     ],
                     req_body: Some(Bytes::from_static(b"hello replay")),
+                    req_body_truncated: false,
                     resp_status: Some(200),
                     resp_headers: None,
                     resp_body: None,

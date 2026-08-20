@@ -298,6 +298,10 @@ pub(crate) async fn replay_http_request(
         .map(|entry| entry.clone())
         .ok_or(StatusCode::BAD_GATEWAY)?;
 
+    if capture.req_body_truncated {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     let method =
         Method::from_bytes(capture.req_method.as_bytes()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let uri = capture
@@ -419,6 +423,7 @@ async fn proxy_request_to_tunnel(
                         .unwrap_or_else(|| "/".to_string()),
                     req_headers,
                     req_body,
+                    req_body_truncated: request.body.len() > MAX_INSPECTION_BODY,
                     resp_status: None,
                     resp_headers: None,
                     resp_body: None,
@@ -1194,6 +1199,38 @@ mod tests {
             response.headers[0],
             ("Transfer-Encoding".to_string(), "chunked".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_rejects_fixed_and_chunked_bodies() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n123456")
+            .await
+            .unwrap();
+        assert!(read_http_response(&mut stream, &Method::GET, 5)
+            .await
+            .is_err());
+
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n123456\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(read_http_response(&mut stream, &Method::GET, 5)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_transfer_coding_is_rejected() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_http_response(&mut stream, &Method::GET, usize::MAX)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

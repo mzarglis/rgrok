@@ -23,6 +23,9 @@ pub struct CapturedRequest {
         deserialize_with = "deserialize_opt_bytes"
     )]
     pub req_body: Option<Bytes>,
+    /// True when the original request body exceeded the configured capture limit.
+    #[serde(default)]
+    pub req_body_truncated: bool,
 
     // Response (filled in when stream closes)
     pub resp_status: Option<u16>,
@@ -101,6 +104,36 @@ pub fn sanitize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .filter(|(name, _)| !is_sensitive_header(name))
         .cloned()
         .collect()
+}
+
+/// Validate an HTTP Host authority for a service that is intentionally bound
+/// only to loopback. Ports are optional, but malformed suffixes are rejected.
+pub fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty()
+            && suffix
+                .strip_prefix(':')
+                .is_none_or(|port| port.parse::<u16>().is_err())
+        {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = authority.split_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn serialize_headers<S>(headers: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
@@ -184,6 +217,7 @@ mod tests {
             req_url: "/".into(),
             req_headers: headers,
             req_body: None,
+            req_body_truncated: false,
             resp_status: Some(200),
             resp_headers: Some(vec![("Set-Cookie".into(), "secret".into())]),
             resp_body: None,
@@ -195,5 +229,25 @@ mod tests {
         assert!(!json.contains("Bearer secret"));
         assert!(!json.contains("Set-Cookie"));
         assert!(json.contains("Accept"));
+    }
+
+    #[test]
+    fn loopback_authority_rejects_malformed_and_rebinding_hosts() {
+        for authority in [
+            "localhost",
+            "localhost:4040",
+            "127.0.0.1:4040",
+            "[::1]:4040",
+        ] {
+            assert!(is_loopback_authority(authority));
+        }
+        for authority in [
+            "attacker.example:4040",
+            "localhost:4040:evil",
+            "[::1].attacker.example",
+            "[::1]:not-a-port",
+        ] {
+            assert!(!is_loopback_authority(authority));
+        }
     }
 }

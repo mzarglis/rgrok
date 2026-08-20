@@ -88,6 +88,14 @@ pub async fn serve(state: Arc<InspectState>, port: u16) -> anyhow::Result<()> {
 }
 
 async fn inspect_security(request: Request, next: Next, state: Arc<InspectState>) -> Response {
+    if !loopback_host_valid(request.headers()) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid inspection UI Host",
+        )
+            .into_response();
+    }
+
     if is_mutating(request.method()) && !csrf_header_valid(request.headers(), &state.csrf_token) {
         return (StatusCode::FORBIDDEN, "missing or invalid CSRF token").into_response();
     }
@@ -130,6 +138,16 @@ fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+fn loopback_host_valid(headers: &HeaderMap) -> bool {
+    let Some(authority) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    rgrok_proto::inspect::is_loopback_authority(authority)
+}
+
 async fn dashboard() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
@@ -170,6 +188,10 @@ async fn replay_request(
     };
     drop(queue);
 
+    if cap.req_body_truncated {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     // Re-issue the HTTP request to the local port
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}{}", state.local_port, cap.req_url);
@@ -188,7 +210,7 @@ async fn replay_request(
 
     let start = std::time::Instant::now();
     match req.send().await {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             let resp_status = resp.status().as_u16();
             let resp_headers: Vec<(String, String)> = resp
@@ -196,11 +218,26 @@ async fn replay_request(
                 .iter()
                 .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.to_string(), vs.to_string())))
                 .collect();
-            let resp_body_bytes = resp.bytes().await.ok();
-            let (resp_body, resp_body_truncated) = resp_body_bytes
-                .as_deref()
-                .map(|body| capture_body(body, state.max_body_bytes))
-                .unwrap_or((None, false));
+            let mut captured = Vec::with_capacity(state.max_body_bytes.min(64 * 1024));
+            let mut resp_body_truncated = false;
+            loop {
+                let chunk = match resp.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to read replay response body");
+                        return Err(StatusCode::BAD_GATEWAY);
+                    }
+                };
+                let remaining = state.max_body_bytes.saturating_sub(captured.len());
+                let copied = chunk.len().min(remaining);
+                captured.extend_from_slice(&chunk[..copied]);
+                if copied < chunk.len() {
+                    resp_body_truncated = true;
+                    break;
+                }
+            }
+            let resp_body = (!captured.is_empty()).then(|| bytes::Bytes::from(captured));
 
             let new_id = uuid::Uuid::new_v4().to_string();
             let replay_capture = rgrok_proto::inspect::CapturedRequest {
@@ -212,6 +249,7 @@ async fn replay_request(
                 req_url: cap.req_url.clone(),
                 req_headers: cap.req_headers.clone(),
                 req_body: cap.req_body.clone(),
+                req_body_truncated: false,
                 resp_status: Some(resp_status),
                 resp_headers: Some(resp_headers),
                 resp_body,
@@ -228,13 +266,6 @@ async fn replay_request(
             Err(StatusCode::BAD_GATEWAY)
         }
     }
-}
-
-fn capture_body(body: &[u8], max_body_bytes: usize) -> (Option<bytes::Bytes>, bool) {
-    let truncated = body.len() > max_body_bytes;
-    let captured = (!body.is_empty() && max_body_bytes > 0)
-        .then(|| bytes::Bytes::copy_from_slice(&body[..body.len().min(max_body_bytes)]));
-    (captured, truncated)
 }
 
 async fn event_stream(
@@ -290,6 +321,7 @@ mod tests {
             req_url: "/api/test".to_string(),
             req_headers: vec![("Accept".to_string(), "text/plain".to_string())],
             req_body: None,
+            req_body_truncated: false,
             resp_status: Some(200),
             resp_headers: None,
             resp_body: None,
@@ -378,6 +410,21 @@ mod tests {
         assert!(csrf_header_valid(&headers, "csrf"));
         assert!(is_mutating(&Method::DELETE));
         assert!(!is_mutating(&Method::GET));
+    }
+
+    #[test]
+    fn loopback_ui_rejects_dns_rebinding_hosts() {
+        for host in ["localhost:4040", "127.0.0.1:4040", "[::1]:4040"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(loopback_host_valid(&headers));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:4040"),
+        );
+        assert!(!loopback_host_valid(&headers));
     }
 
     #[test]

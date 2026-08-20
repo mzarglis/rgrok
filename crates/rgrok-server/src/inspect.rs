@@ -58,6 +58,7 @@ pub fn capture_request_from_bytes(
         req_url: url,
         req_headers: rgrok_proto::inspect::sanitize_headers(&headers),
         req_body: body,
+        req_body_truncated: false,
         resp_status: None,
         resp_headers: None,
         resp_body: None,

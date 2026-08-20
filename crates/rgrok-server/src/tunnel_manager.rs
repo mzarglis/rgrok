@@ -620,6 +620,7 @@ mod tests {
             req_url: format!("http://example.com/{}", id),
             req_headers: vec![],
             req_body: None,
+            req_body_truncated: false,
             resp_status: Some(200),
             resp_headers: None,
             resp_body: None,

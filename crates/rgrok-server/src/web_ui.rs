@@ -30,13 +30,15 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 struct UiSecurity {
     auth_token: Option<String>,
     csrf_token: String,
+    require_loopback_host: bool,
 }
 
 impl UiSecurity {
-    fn new(auth_token: Option<String>) -> Self {
+    fn new(auth_token: Option<String>, require_loopback_host: bool) -> Self {
         Self {
             auth_token: auth_token.filter(|token| !token.trim().is_empty()),
             csrf_token: uuid::Uuid::new_v4().to_string(),
+            require_loopback_host,
         }
     }
 }
@@ -60,7 +62,10 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
         anyhow::bail!("refusing non-loopback inspection UI without inspect.ui_auth_token");
     }
 
-    let security = Arc::new(UiSecurity::new(state.config.inspect.ui_auth_token.clone()));
+    let security = Arc::new(UiSecurity::new(
+        state.config.inspect.ui_auth_token.clone(),
+        crate::config::is_loopback_bind(&state.config.inspect.ui_bind),
+    ));
     let middleware_security = security.clone();
     let app = Router::new()
         .route("/", get(dashboard))
@@ -89,6 +94,14 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
 }
 
 async fn inspect_security(request: Request, next: Next, security: Arc<UiSecurity>) -> Response {
+    if security.require_loopback_host && !loopback_host_valid(request.headers()) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid inspection UI Host",
+        )
+            .into_response();
+    }
+
     if let Some(token) = security.auth_token.as_deref() {
         let authorized = request
             .headers()
@@ -164,6 +177,16 @@ fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
         let (key, value) = part.trim().split_once('=')?;
         (key == name).then_some(value)
     })
+}
+
+fn loopback_host_valid(headers: &HeaderMap) -> bool {
+    let Some(authority) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    rgrok_proto::inspect::is_loopback_authority(authority)
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -304,6 +327,21 @@ mod tests {
         assert!(csrf_header_valid(&headers, "csrf"));
         assert!(is_mutating(&Method::POST));
         assert!(!is_mutating(&Method::GET));
+    }
+
+    #[test]
+    fn loopback_ui_rejects_dns_rebinding_hosts() {
+        for host in ["localhost:4040", "127.0.0.1:4040", "[::1]:4040"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(loopback_host_valid(&headers));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:4040"),
+        );
+        assert!(!loopback_host_valid(&headers));
     }
 
     #[test]
