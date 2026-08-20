@@ -31,7 +31,7 @@ pub struct AuthSection {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsSection {
     #[serde(default = "default_inspect_port")]
     pub inspect_port: u16,
@@ -39,6 +39,16 @@ pub struct DefaultsSection {
     pub inspect: bool,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+impl Default for DefaultsSection {
+    fn default() -> Self {
+        Self {
+            inspect_port: default_inspect_port(),
+            inspect: default_inspect(),
+            max_body_bytes: default_max_body_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,12 +166,25 @@ mod tests {
         assert_eq!(config.server.host, "tunnel.example.com");
         assert_eq!(config.server.port, 7835);
         assert_eq!(config.auth.token, "");
-        // DefaultsSection derives Default, so Rust defaults (0/false) apply,
-        // not the serde default functions. The serde defaults only kick in
-        // when deserializing from TOML with missing fields.
-        assert_eq!(config.defaults.inspect_port, 0);
-        assert!(!config.defaults.inspect);
-        assert_eq!(config.defaults.max_body_bytes, 0);
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.format, "pretty");
+    }
+
+    #[test]
+    fn test_missing_config_file_uses_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("rgrok-client-config-{}.toml", uuid::Uuid::new_v4()));
+        let config = ClientConfig::load(&path).expect("load missing config");
+
+        assert_eq!(config.server.host, "tunnel.example.com");
+        assert_eq!(config.server.port, 7835);
+        assert!(config.auth.token.is_empty());
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "pretty");
     }
@@ -217,15 +240,32 @@ token = ""
         // port should fall back to default
         assert_eq!(config.server.port, 7835);
         assert!(!config.server.insecure);
-        // defaults section is missing from TOML, so serde uses
-        // DefaultsSection's derive(Default) (Rust Default: 0/false),
-        // NOT the per-field serde default functions.
-        assert_eq!(config.defaults.inspect_port, 0);
-        assert!(!config.defaults.inspect);
-        assert_eq!(config.defaults.max_body_bytes, 0);
+        // The defaults section is missing from TOML, so serde uses
+        // DefaultsSection::default(), which matches its field defaults.
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
         // logging section should be fully defaulted
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "pretty");
+    }
+
+    #[test]
+    fn test_config_empty_defaults_section_uses_field_defaults() {
+        let toml_str = r#"
+[server]
+host = "empty-defaults.example.com"
+
+[auth]
+token = ""
+
+[defaults]
+"#;
+        let config: ClientConfig = toml::from_str(toml_str).expect("deserialize empty defaults");
+
+        assert_eq!(config.defaults.inspect_port, 4040);
+        assert!(config.defaults.inspect);
+        assert_eq!(config.defaults.max_body_bytes, 1_048_576);
     }
 
     #[test]
