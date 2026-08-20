@@ -58,9 +58,18 @@ pub async fn serve_https(state: Arc<ServerState>, tls_acceptor: TlsAcceptor) -> 
             }
         };
         let state = state.clone();
-        let acceptor = tls_acceptor.clone();
+        let mut tls_config_rx = state.tls_config_rx.clone();
+        let initial_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
+            // Build an acceptor from the latest watch value for each new
+            // connection. Existing TLS sessions remain on their original
+            // config while new sessions use a renewed certificate.
+            let acceptor = tls_config_rx
+                .borrow_and_update()
+                .clone()
+                .map(TlsAcceptor::from)
+                .unwrap_or(initial_acceptor);
             let tls_stream = match acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {

@@ -77,20 +77,19 @@ async fn main() -> anyhow::Result<()> {
     info!("rgrok-server starting");
     info!(domain = %config.server.domain, "Server configuration loaded");
 
-    // Load TLS config — try files/ACME cache/self-signed first,
-    // then attempt ACME provisioning if Cloudflare is configured and no certs exist
-    let tls_config = match tls::load_tls_config(&config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            if !config.cloudflare.api_token.is_empty() && !config.cloudflare.zone_id.is_empty() {
-                info!("No existing TLS certs, attempting ACME provisioning: {}", e);
-                tls::provision_wildcard_cert(&config).await?
-            } else {
-                return Err(e);
-            }
+    // Select the certificate source before loading it. In particular, a
+    // Cloudflare-enabled first run must provision ACME instead of silently
+    // falling back to a self-signed development certificate.
+    let tls_source = tls::select_tls_source(&config)?;
+    let tls_config = match tls_source {
+        tls::TlsSource::AcmeProvision => {
+            info!("No existing TLS certs, attempting Cloudflare ACME provisioning");
+            tls::provision_wildcard_cert(&config).await?
         }
+        _ => tls::load_tls_config(&config)?,
     };
     let tls_acceptor = TlsAcceptor::from(tls_config.clone());
+    let control_tls_enabled = !matches!(tls_source, tls::TlsSource::SelfSigned);
 
     // Create shared state
     let state = Arc::new(ServerState::new(config.clone()));
@@ -102,19 +101,14 @@ async fn main() -> anyhow::Result<()> {
     let control_listener =
         tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.server.control_port)).await?;
 
-    // Spawn control plane listener (with TLS if certs are available)
+    // Spawn control plane listener. Whether control traffic uses TLS is based
+    // on the selected startup source, not a later filesystem existence check.
     let control_state = state.clone();
-    let control_tls = if config.tls.cert_file.is_some() || config.tls.key_file.is_some() {
+    let control_tls = if control_tls_enabled {
         Some(tls_acceptor.clone())
     } else {
-        // Dev mode: check if ACME certs exist on disk
-        let cert_path = std::path::PathBuf::from(&config.tls.cert_dir).join("fullchain.pem");
-        if cert_path.exists() {
-            Some(tls_acceptor.clone())
-        } else {
-            info!("No TLS certs configured — control plane running without TLS (dev mode)");
-            None
-        }
+        info!("No production TLS source configured — control plane running without TLS (dev mode)");
+        None
     };
     tokio::spawn(async move {
         if let Err(e) = control::serve(control_state, control_tls, control_listener).await {

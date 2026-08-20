@@ -33,9 +33,19 @@ pub async fn serve(
         };
         let state = state.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let mut tls_config_rx = state.tls_config_rx.clone();
 
         tokio::spawn(async move {
-            if let Some(acceptor) = tls_acceptor {
+            if let Some(initial_acceptor) = tls_acceptor {
+                // Build an acceptor from the latest config for every new
+                // connection so certificate renewal takes effect without a
+                // listener restart. Keep the startup acceptor as a fallback
+                // for the short window before the initial watch update.
+                let acceptor = tls_config_rx
+                    .borrow_and_update()
+                    .clone()
+                    .map(TlsAcceptor::from)
+                    .unwrap_or(initial_acceptor);
                 match acceptor.accept(tcp_stream).await {
                     Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
                         Ok(ws) => handle_client(ws, state).await,
