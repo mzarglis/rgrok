@@ -81,6 +81,10 @@ pub struct InspectConfig {
     pub ui_bind: String,
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
+    /// Optional HTTP Basic/Bearer token for the inspection UI. A token is
+    /// mandatory when `ui_bind` is not a loopback address.
+    #[serde(default)]
+    pub ui_auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +136,15 @@ fn default_ui_bind() -> String {
 }
 fn default_buffer_size() -> usize {
     100
+}
+
+pub(crate) fn is_loopback_bind(bind: &str) -> bool {
+    let bind = bind.trim().trim_start_matches('[').trim_end_matches(']');
+    bind.eq_ignore_ascii_case("localhost")
+        || bind
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -186,6 +199,20 @@ impl Config {
         }
         if self.server.max_response_body_bytes == 0 {
             anyhow::bail!("server.max_response_body_bytes must be greater than zero");
+        }
+        if self.inspect.ui_port != 0
+            && !is_loopback_bind(&self.inspect.ui_bind)
+            && self
+                .inspect
+                .ui_auth_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .is_none()
+        {
+            anyhow::bail!(
+                "inspect.ui_auth_token must be configured when inspect.ui_bind is non-loopback"
+            );
         }
         Ok(())
     }
@@ -250,6 +277,7 @@ impl Default for Config {
                 ui_port: 0,
                 ui_bind: default_ui_bind(),
                 buffer_size: default_buffer_size(),
+                ui_auth_token: None,
             },
             logging: LoggingConfig {
                 level: default_log_level(),
@@ -308,6 +336,7 @@ acme_email = "test@example.com"
         assert!(!config.cloudflare.per_tunnel_dns);
         assert_eq!(config.inspect.ui_bind, "127.0.0.1");
         assert_eq!(config.inspect.buffer_size, 100);
+        assert!(config.inspect.ui_auth_token.is_none());
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "json");
     }
@@ -464,6 +493,18 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
     }
 
     #[test]
+    fn non_loopback_inspection_requires_authentication() {
+        let mut config: Config = toml::from_str(valid_toml()).unwrap();
+        config.inspect.ui_port = 4040;
+        config.inspect.ui_bind = "0.0.0.0".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("ui_auth_token"));
+
+        config.inspect.ui_auth_token = Some("ui-secret".to_string());
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn test_zero_idle_timeout_rejected() {
         let mut config = Config::default();
         config.server.tunnel_idle_timeout_secs = 0;
@@ -486,5 +527,15 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
         assert!(err
             .to_string()
             .contains("max_response_body_bytes must be greater than zero"));
+    }
+
+    #[test]
+    fn loopback_inspection_keeps_developer_default() {
+        let mut config: Config = toml::from_str(valid_toml()).unwrap();
+        config.inspect.ui_port = 4040;
+        config.inspect.ui_bind = "127.0.0.1".to_string();
+        config.validate().unwrap();
+        config.inspect.ui_bind = "::1".to_string();
+        config.validate().unwrap();
     }
 }

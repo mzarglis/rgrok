@@ -194,6 +194,22 @@ key_file  = "/etc/ssl/private/wildcard.key"
 
 The server performs hot-reload every 12 hours — if the cert on disk changes, it picks it up without a restart.
 
+## Inspection UI security
+
+The server inspection UI is disabled by default. If enabled, keep
+`[inspect].ui_bind = "127.0.0.1"` (or `::1`) for the no-configuration local
+developer workflow. Captures include request and response bodies, so do not
+expose this listener directly to the Internet.
+
+If the UI must be reachable on another interface, configure a long random
+`[inspect].ui_auth_token`. Startup fails closed when a non-loopback bind has no
+token. The UI accepts `Authorization: Bearer <token>` for API clients and HTTP
+Basic authentication in a browser (username `rgrok`, password the token).
+All routes, including the dashboard and SSE stream, use the same check, and
+mutating requests require the UI's CSRF header. Existing deployments that bind
+the UI publicly must add the token before upgrading; no token is needed for the
+default loopback binding.
+
 ## Docker Deployment
 
 The image does not contain a server configuration or a default JWT signing

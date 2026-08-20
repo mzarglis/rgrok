@@ -178,6 +178,14 @@ When a tunnel is open, a local web UI is available at `http://localhost:4040` (o
 
 Inspection is enabled by default for `http` tunnels. Disable it with `--no-inspect` or set `inspect = false` in the config `[defaults]` section.
 
+The client UI binds to loopback only. It protects replay and clear mutations
+with a per-process CSRF token and removes credential-bearing headers (such as
+`Authorization`, cookies, API keys, and tokens) from captures and replays.
+Request and response bodies can still contain sensitive application data; use
+`--no-inspect` when body capture is not appropriate. The server UI follows the
+same redaction rules and additionally requires `inspect.ui_auth_token` for any
+non-loopback bind.
+
 ---
 
 ## Environment Variables

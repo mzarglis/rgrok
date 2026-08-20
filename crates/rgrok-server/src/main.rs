@@ -286,6 +286,7 @@ mod tests {
                 ui_port: 0,
                 ui_bind: "127.0.0.1".to_string(),
                 buffer_size: 100,
+                ui_auth_token: None,
             },
             logging: config::LoggingConfig {
                 level: "warn".to_string(),

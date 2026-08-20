@@ -185,7 +185,7 @@ fn parse_request_for_capture(data: &[u8], max_body_bytes: usize) -> Option<Captu
         tunnel_id: String::new(),
         req_method: method,
         req_url: url,
-        req_headers: headers,
+        req_headers: rgrok_proto::inspect::sanitize_headers(&headers),
         req_body: body,
         resp_status: None,
         resp_headers: None,
@@ -217,7 +217,7 @@ fn parse_response_headers(data: &[u8]) -> Vec<(String, String)> {
             headers.push((key.to_string(), value.to_string()));
         }
     }
-    headers
+    rgrok_proto::inspect::sanitize_headers(&headers)
 }
 
 fn find_body_offset(data: &[u8]) -> Option<usize> {

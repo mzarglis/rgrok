@@ -13,6 +13,10 @@ pub struct CapturedRequest {
     // Request
     pub req_method: String,
     pub req_url: String,
+    #[serde(
+        serialize_with = "serialize_headers",
+        deserialize_with = "deserialize_headers"
+    )]
     pub req_headers: Vec<(String, String)>,
     #[serde(
         serialize_with = "serialize_opt_bytes",
@@ -22,6 +26,10 @@ pub struct CapturedRequest {
 
     // Response (filled in when stream closes)
     pub resp_status: Option<u16>,
+    #[serde(
+        serialize_with = "serialize_opt_headers",
+        deserialize_with = "deserialize_opt_headers"
+    )]
     pub resp_headers: Option<Vec<(String, String)>>,
     #[serde(
         serialize_with = "serialize_opt_bytes",
@@ -63,6 +71,76 @@ where
     }
 }
 
+/// Header names whose values commonly contain credentials or other bearer
+/// secrets. These are omitted from captures, JSON, SSE, and replay requests.
+pub fn is_sensitive_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "api-key"
+            | "x-auth-token"
+            | "x-csrf-token"
+            | "sec-websocket-key"
+    ) || name.contains("api-key")
+        || name.contains("apikey")
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("credential")
+}
+
+/// Remove security-sensitive headers before a capture is retained or replayed.
+pub fn sanitize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !is_sensitive_header(name))
+        .cloned()
+        .collect()
+}
+
+fn serialize_headers<S>(headers: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    sanitize_headers(headers).serialize(serializer)
+}
+
+fn deserialize_headers<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let headers = Vec::<(String, String)>::deserialize(deserializer)?;
+    Ok(sanitize_headers(&headers))
+}
+
+fn serialize_opt_headers<S>(
+    headers: &Option<Vec<(String, String)>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    headers
+        .as_ref()
+        .map(|headers| sanitize_headers(headers))
+        .serialize(serializer)
+}
+
+fn deserialize_opt_headers<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<(String, String)>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let headers = Option::<Vec<(String, String)>>::deserialize(deserializer)?;
+    Ok(headers.map(|headers| sanitize_headers(&headers)))
+}
+
 fn deserialize_opt_bytes<'de, D>(deserializer: D) -> Result<Option<Bytes>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -77,5 +155,45 @@ where
             Ok(Some(Bytes::from(decoded)))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_headers_are_removed_from_captures_and_json() {
+        let headers = vec![
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("Cookie".to_string(), "session=secret".to_string()),
+            ("X-Api-Key".to_string(), "secret".to_string()),
+            ("Accept".to_string(), "text/plain".to_string()),
+        ];
+        assert_eq!(
+            sanitize_headers(&headers),
+            vec![("Accept".into(), "text/plain".into())]
+        );
+
+        let capture = CapturedRequest {
+            id: "id".into(),
+            captured_at: Utc::now(),
+            duration_ms: None,
+            tunnel_id: "tunnel".into(),
+            req_method: "GET".into(),
+            req_url: "/".into(),
+            req_headers: headers,
+            req_body: None,
+            resp_status: Some(200),
+            resp_headers: Some(vec![("Set-Cookie".into(), "secret".into())]),
+            resp_body: None,
+            resp_body_truncated: false,
+            remote_addr: "".into(),
+            tls_version: None,
+        };
+        let json = serde_json::to_string(&capture).unwrap();
+        assert!(!json.contains("Bearer secret"));
+        assert!(!json.contains("Set-Cookie"));
+        assert!(json.contains("Accept"));
     }
 }

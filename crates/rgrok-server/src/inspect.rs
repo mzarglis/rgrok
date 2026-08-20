@@ -56,7 +56,7 @@ pub fn capture_request_from_bytes(
         tunnel_id: tunnel_id.to_string(),
         req_method: method,
         req_url: url,
-        req_headers: headers,
+        req_headers: rgrok_proto::inspect::sanitize_headers(&headers),
         req_body: body,
         resp_status: None,
         resp_headers: None,
@@ -94,5 +94,5 @@ pub fn parse_response_headers(data: &[u8]) -> Vec<(String, String)> {
         }
     }
 
-    headers
+    rgrok_proto::inspect::sanitize_headers(&headers)
 }

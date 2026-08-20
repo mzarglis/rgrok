@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::header::{self, HeaderMap, HeaderValue};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
-use axum::response::{Html, IntoResponse, Json};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::stream::Stream;
@@ -13,6 +15,7 @@ use tracing::info;
 
 use rgrok_proto::inspect::CapturedRequest;
 
+use crate::auth;
 use crate::tunnel_manager::ServerState;
 
 /// Replay result returned to the client
@@ -23,13 +26,42 @@ struct ReplayResult {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
+#[derive(Clone)]
+struct UiSecurity {
+    auth_token: Option<String>,
+    csrf_token: String,
+}
+
+impl UiSecurity {
+    fn new(auth_token: Option<String>) -> Self {
+        Self {
+            auth_token: auth_token.filter(|token| !token.trim().is_empty()),
+            csrf_token: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
 /// Serve the web inspection UI
 pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
     if state.config.inspect.ui_port == 0 {
         info!("Inspection UI disabled (ui_port = 0)");
         return Ok(());
     }
+    if !crate::config::is_loopback_bind(&state.config.inspect.ui_bind)
+        && state
+            .config
+            .inspect
+            .ui_auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .is_none()
+    {
+        anyhow::bail!("refusing non-loopback inspection UI without inspect.ui_auth_token");
+    }
 
+    let security = Arc::new(UiSecurity::new(state.config.inspect.ui_auth_token.clone()));
+    let middleware_security = security.clone();
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/api/requests", get(list_requests))
@@ -38,7 +70,11 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
         .route("/api/requests/{id}/replay", post(replay_request))
         .route("/api/stream", get(event_stream))
         .route("/api/status", get(server_status))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let security = middleware_security.clone();
+            async move { inspect_security(request, next, security).await }
+        }));
 
     let bind_addr = format!(
         "{}:{}",
@@ -50,6 +86,84 @@ pub async fn serve(state: Arc<ServerState>) -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn inspect_security(request: Request, next: Next, security: Arc<UiSecurity>) -> Response {
+    if let Some(token) = security.auth_token.as_deref() {
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| authorized_header(value, token))
+            .unwrap_or(false);
+        if !authorized {
+            return unauthorized_response();
+        }
+    }
+
+    if is_mutating(request.method()) && !csrf_header_valid(request.headers(), &security.csrf_token)
+    {
+        return (StatusCode::FORBIDDEN, "missing or invalid CSRF token").into_response();
+    }
+
+    let has_csrf_cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| cookie_value(value, "rgrok_csrf").is_some())
+        .unwrap_or(false);
+    let mut response = next.run(request).await;
+    if !has_csrf_cookie {
+        let cookie = format!(
+            "rgrok_csrf={}; Path=/; SameSite=Strict",
+            security.csrf_token
+        );
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+fn authorized_header(value: &str, token: &str) -> bool {
+    value
+        .strip_prefix("Bearer ")
+        .map(|candidate| candidate == token)
+        .unwrap_or(false)
+        || auth::parse_basic_auth_header(value)
+            .map(|(user, password)| user == "rgrok" && password == token)
+            .unwrap_or(false)
+}
+
+fn unauthorized_response() -> Response {
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"rgrok inspect\""),
+    );
+    response
+}
+
+fn is_mutating(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    )
+}
+
+fn csrf_header_valid(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("x-rgrok-csrf")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == expected)
+        .unwrap_or(false)
+}
+
+fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -132,9 +246,9 @@ async fn replay_request(
     let method: reqwest::Method = cap.req_method.parse().unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, &url);
 
-    for (k, v) in &cap.req_headers {
+    for (k, v) in rgrok_proto::inspect::sanitize_headers(&cap.req_headers) {
         if !k.eq_ignore_ascii_case("host") {
-            req = req.header(k.as_str(), v.as_str());
+            req = req.header(k, v);
         }
     }
     if let Some(body) = &cap.req_body {
@@ -180,4 +294,50 @@ async fn server_status(State(state): State<Arc<ServerState>>) -> Json<serde_json
         "tcp_tunnels": tcp_tunnels,
         "max_tunnels": state.config.server.max_tunnels,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_ui_auth_accepts_bearer_and_basic_credentials() {
+        let token = "ui-secret";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ui-secret"),
+        );
+        assert!(authorized_header(
+            headers
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            token
+        ));
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("rgrok:ui-secret");
+        assert!(authorized_header(&format!("Basic {encoded}"), token));
+        assert!(!authorized_header("Bearer wrong", token));
+    }
+
+    #[test]
+    fn mutations_require_csrf_header() {
+        let headers = HeaderMap::new();
+        assert!(!csrf_header_valid(&headers, "csrf"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rgrok-csrf", HeaderValue::from_static("csrf"));
+        assert!(csrf_header_valid(&headers, "csrf"));
+        assert!(is_mutating(&Method::POST));
+        assert!(!is_mutating(&Method::GET));
+    }
+
+    #[test]
+    fn dashboard_uses_dom_apis_instead_of_unsafe_interpolation() {
+        assert!(!INDEX_HTML.contains("innerHTML"));
+        assert!(!INDEX_HTML.contains("onclick="));
+        assert!(INDEX_HTML.contains("textContent"));
+    }
 }

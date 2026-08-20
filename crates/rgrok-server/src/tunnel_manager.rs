@@ -494,7 +494,12 @@ impl ServerState {
     }
 
     /// Store a captured request for inspection
-    pub async fn store_capture(&self, subdomain: &str, capture: CapturedRequest) {
+    pub async fn store_capture(&self, subdomain: &str, mut capture: CapturedRequest) {
+        capture.req_headers = rgrok_proto::inspect::sanitize_headers(&capture.req_headers);
+        capture.resp_headers = capture
+            .resp_headers
+            .as_ref()
+            .map(|headers| rgrok_proto::inspect::sanitize_headers(headers));
         if let Some(captures) = self.captures.get(subdomain) {
             let mut queue = captures.lock().await;
             if queue.len() >= self.config.inspect.buffer_size {

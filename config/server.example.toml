@@ -73,6 +73,9 @@ per_tunnel_dns = false
 # Bind to 127.0.0.1 only when running on VPS
 ui_port = 0
 ui_bind = "127.0.0.1"
+# Optional HTTP Basic/Bearer token for the UI. Required when ui_bind is not
+# loopback (username "rgrok" when using the browser's Basic Auth prompt).
+# ui_auth_token = "change-this-to-a-long-random-value"
 
 # Max requests to keep in memory per tunnel
 buffer_size = 100

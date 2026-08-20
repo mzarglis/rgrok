@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::header::{self, HeaderMap, HeaderValue};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
-use axum::response::{Html, IntoResponse, Json};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::stream::Stream;
@@ -24,6 +26,7 @@ pub struct InspectState {
     pub max_captures: usize,
     /// Maximum number of request/response body bytes retained per capture.
     pub max_body_bytes: usize,
+    pub csrf_token: String,
 }
 
 impl InspectState {
@@ -35,11 +38,18 @@ impl InspectState {
             local_port,
             max_captures: 100,
             max_body_bytes,
+            csrf_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 
     /// Store a completed captured request
     pub async fn store_capture(&self, capture: CapturedRequest) {
+        let mut capture = capture;
+        capture.req_headers = rgrok_proto::inspect::sanitize_headers(&capture.req_headers);
+        capture.resp_headers = capture
+            .resp_headers
+            .as_ref()
+            .map(|headers| rgrok_proto::inspect::sanitize_headers(headers));
         let mut queue = self.captures.lock().await;
         if queue.len() >= self.max_captures {
             queue.pop_front();
@@ -53,6 +63,7 @@ impl InspectState {
 
 /// Serve the client-side inspection UI on the given port
 pub async fn serve(state: Arc<InspectState>, port: u16) -> anyhow::Result<()> {
+    let middleware_state = state.clone();
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/api/requests", get(list_requests))
@@ -61,7 +72,11 @@ pub async fn serve(state: Arc<InspectState>, port: u16) -> anyhow::Result<()> {
         .route("/api/requests/{id}/replay", post(replay_request))
         .route("/api/stream", get(event_stream))
         .route("/api/status", get(tunnel_status))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let state = middleware_state.clone();
+            async move { inspect_security(request, next, state).await }
+        }));
 
     let bind_addr = format!("127.0.0.1:{}", port);
     info!("Inspection UI listening on http://{}", bind_addr);
@@ -70,6 +85,49 @@ pub async fn serve(state: Arc<InspectState>, port: u16) -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn inspect_security(request: Request, next: Next, state: Arc<InspectState>) -> Response {
+    if is_mutating(request.method()) && !csrf_header_valid(request.headers(), &state.csrf_token) {
+        return (StatusCode::FORBIDDEN, "missing or invalid CSRF token").into_response();
+    }
+
+    let has_csrf_cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| cookie_value(value, "rgrok_csrf").is_some())
+        .unwrap_or(false);
+    let mut response = next.run(request).await;
+    if !has_csrf_cookie {
+        let cookie = format!("rgrok_csrf={}; Path=/; SameSite=Strict", state.csrf_token);
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+fn is_mutating(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    )
+}
+
+fn csrf_header_valid(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("x-rgrok-csrf")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == expected)
+        .unwrap_or(false)
+}
+
+fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 async fn dashboard() -> Html<&'static str> {
@@ -118,10 +176,10 @@ async fn replay_request(
     let method: reqwest::Method = cap.req_method.parse().unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, &url);
 
-    for (k, v) in &cap.req_headers {
+    for (k, v) in rgrok_proto::inspect::sanitize_headers(&cap.req_headers) {
         // Skip host header since we're replaying locally
         if !k.eq_ignore_ascii_case("host") {
-            req = req.header(k.as_str(), v.as_str());
+            req = req.header(k, v);
         }
     }
     if let Some(body) = &cap.req_body {
@@ -309,5 +367,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn mutations_require_csrf_header() {
+        let headers = HeaderMap::new();
+        assert!(!csrf_header_valid(&headers, "csrf"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rgrok-csrf", HeaderValue::from_static("csrf"));
+        assert!(csrf_header_valid(&headers, "csrf"));
+        assert!(is_mutating(&Method::DELETE));
+        assert!(!is_mutating(&Method::GET));
+    }
+
+    #[test]
+    fn dashboard_uses_dom_apis_instead_of_unsafe_interpolation() {
+        assert!(!INDEX_HTML.contains("innerHTML"));
+        assert!(!INDEX_HTML.contains("onclick="));
+        assert!(INDEX_HTML.contains("textContent"));
     }
 }

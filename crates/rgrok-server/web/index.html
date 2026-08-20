@@ -70,7 +70,7 @@
   <h1><span>rgrok</span> inspect</h1>
   <div class="toolbar">
     <input type="text" id="filter" placeholder="Filter by path, method, status...">
-    <button class="btn btn-danger" onclick="clearAll()">Clear</button>
+    <button class="btn btn-danger" id="clearButton" type="button">Clear</button>
   </div>
 </header>
 <div class="status-bar" id="statusBar">
@@ -90,6 +90,24 @@ let requests = [];
 let selected = null;
 let activeTab = 'headers';
 
+function element(tag, className, value) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (value !== undefined && value !== null) node.textContent = String(value);
+  return node;
+}
+
+function csrfToken() {
+  const match = document.cookie.match(/(?:^|;\s*)rgrok_csrf=([^;]*)/);
+  if (!match) return '';
+  try { return decodeURIComponent(match[1]); } catch { return match[1]; }
+}
+
+function mutate(url, options) {
+  const headers = Object.assign({}, options && options.headers, {'X-rgrok-CSRF': csrfToken()});
+  return fetch(url, Object.assign({}, options, {headers}));
+}
+
 async function loadRequests() {
   try {
     const r = await fetch(API + '/api/requests');
@@ -102,10 +120,12 @@ async function loadStatus() {
   try {
     const r = await fetch(API + '/api/status');
     const s = await r.json();
-    document.getElementById('statusBar').innerHTML =
-      `<span><span class="dot"></span>${s.domain || 'rgrok'}</span>` +
-      `<span>Tunnels: ${s.active_tunnels || 0}</span>` +
-      `<span>TCP: ${s.tcp_tunnels || 0}</span>`;
+    const bar = document.getElementById('statusBar');
+    const connected = element('span');
+    connected.append(element('span', 'dot'), document.createTextNode(s.domain || 'rgrok'));
+    bar.replaceChildren(connected,
+      element('span', '', 'Tunnels: ' + (s.active_tunnels || 0)),
+      element('span', '', 'TCP: ' + (s.tcp_tunnels || 0)));
   } catch(e) {}
 }
 
@@ -138,17 +158,22 @@ function renderList() {
     return (r.req_method + ' ' + r.req_url + ' ' + (r.resp_status || '')).toLowerCase().includes(filter);
   });
   const el = document.getElementById('requestList');
-  if (!filtered.length) { el.innerHTML = '<div class="empty-list">No requests captured</div>'; return; }
-  el.innerHTML = filtered.map(r => {
-    const sc = statusClass(r.resp_status);
-    const dur = r.duration_ms != null ? r.duration_ms + 'ms' : '...';
-    return `<div class="request-item${selected===r.id?' active':''}" onclick="selectReq('${r.id}')">
-      <span class="method method-${r.req_method}">${r.req_method}</span>
-      <span class="req-path">${r.req_url}</span>
-      <span class="req-status ${sc}">${r.resp_status||''}</span>
-      <span class="req-duration">${dur}</span>
-    </div>`;
-  }).join('');
+  el.replaceChildren();
+  if (!filtered.length) { el.append(element('div', 'empty-list', 'No requests captured')); return; }
+  filtered.forEach(r => {
+    const item = element('div', 'request-item' + (selected === r.id ? ' active' : ''));
+    item.addEventListener('click', () => selectReq(r.id));
+    const method = element('span', 'method ' + methodClass(r.req_method), r.req_method);
+    item.append(method,
+      element('span', 'req-path', r.req_url),
+      element('span', 'req-status ' + statusClass(r.resp_status), r.resp_status || ''),
+      element('span', 'req-duration', r.duration_ms != null ? r.duration_ms + 'ms' : '...'));
+    el.append(item);
+  });
+}
+
+function methodClass(method) {
+  return ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method) ? 'method-' + method : 'method';
 }
 
 function statusClass(s) {
@@ -168,76 +193,96 @@ function selectReq(id) {
 
 function renderDetail(r) {
   const pane = document.getElementById('detailPane');
-  pane.innerHTML = `
-    <div class="detail-header">
-      <span><strong>${r.req_method}</strong> ${r.req_url}</span>
-      <button class="btn" onclick="replay('${r.id}')">Replay</button>
-    </div>
-    <div class="tabs">
-      <div class="tab${activeTab==='headers'?' active':''}" onclick="setTab('headers')">Headers</div>
-      <div class="tab${activeTab==='reqbody'?' active':''}" onclick="setTab('reqbody')">Request Body</div>
-      <div class="tab${activeTab==='response'?' active':''}" onclick="setTab('response')">Response</div>
-      <div class="tab${activeTab==='timing'?' active':''}" onclick="setTab('timing')">Timing</div>
-    </div>
-    <div class="tab-content">${tabContent(r)}</div>`;
+  pane.replaceChildren();
+  const header = element('div', 'detail-header');
+  const title = element('span');
+  title.append(element('strong', '', r.req_method), document.createTextNode(' ' + (r.req_url || '')));
+  const replayButton = element('button', 'btn', 'Replay');
+  replayButton.type = 'button';
+  replayButton.addEventListener('click', () => replay(r.id));
+  header.append(title, replayButton);
+  const tabs = element('div', 'tabs');
+  [['headers', 'Headers'], ['reqbody', 'Request Body'], ['response', 'Response'], ['timing', 'Timing']]
+    .forEach(([name, label]) => {
+      const tab = element('div', 'tab' + (activeTab === name ? ' active' : ''), label);
+      tab.addEventListener('click', () => setTab(name));
+      tabs.append(tab);
+    });
+  const content = element('div', 'tab-content');
+  content.append(tabContent(r));
+  pane.append(header, tabs, content);
 }
 
 function setTab(t) { activeTab = t; const r = requests.find(x => x.id === selected); if(r) renderDetail(r); }
 
 function tabContent(r) {
   if (activeTab === 'headers') {
-    let h = '<h4 style="margin-bottom:8px">Request Headers</h4><table class="headers">';
-    (r.req_headers||[]).forEach(([k,v]) => h += `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`);
-    h += '</table>';
+    const wrapper = document.createDocumentFragment();
+    wrapper.append(element('h4', '', 'Request Headers'));
+    const table = element('table', 'headers');
+    (r.req_headers || []).forEach(([k, v]) => appendHeaderRow(table, k, v));
+    wrapper.append(table);
     if (r.resp_headers) {
-      h += '<h4 style="margin:16px 0 8px">Response Headers</h4><table class="headers">';
-      r.resp_headers.forEach(([k,v]) => h += `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`);
-      h += '</table>';
+      wrapper.append(element('h4', '', 'Response Headers'));
+      const responseTable = element('table', 'headers');
+      r.resp_headers.forEach(([k, v]) => appendHeaderRow(responseTable, k, v));
+      wrapper.append(responseTable);
     }
-    return h;
+    return wrapper;
   }
   if (activeTab === 'reqbody') {
-    if (!r.req_body) return '<div style="color:var(--muted)">No request body</div>';
-    try { return '<pre class="body">' + esc(atob(r.req_body)) + '</pre>'; }
-    catch { return '<pre class="body">' + esc(r.req_body) + '</pre>'; }
+    if (!r.req_body) return element('div', 'empty-list', 'No request body');
+    return element('pre', 'body', decodeBody(r.req_body));
   }
   if (activeTab === 'response') {
-    let h = r.resp_status ? `<p>Status: <strong>${r.resp_status}</strong></p>` : '<p style="color:var(--muted)">Awaiting response...</p>';
+    const wrapper = document.createDocumentFragment();
+    const status = element('p');
+    status.append(document.createTextNode(r.resp_status ? 'Status: ' : 'Awaiting response...'));
+    if (r.resp_status) status.append(element('strong', '', r.resp_status));
+    wrapper.append(status);
     if (r.resp_body) {
-      try { h += '<pre class="body">' + esc(atob(r.resp_body)) + '</pre>'; }
-      catch { h += '<pre class="body">' + esc(r.resp_body) + '</pre>'; }
-      if (r.resp_body_truncated) h += '<p style="color:var(--yellow);margin-top:8px">Body truncated (>1MB)</p>';
+      wrapper.append(element('pre', 'body', decodeBody(r.resp_body)));
+      if (r.resp_body_truncated) wrapper.append(element('p', '', 'Body truncated (>1MB)'));
     }
-    return h;
+    return wrapper;
   }
   if (activeTab === 'timing') {
-    return `<table class="headers">
-      <tr><td>Captured at</td><td>${r.captured_at || 'N/A'}</td></tr>
-      <tr><td>Duration</td><td>${r.duration_ms != null ? r.duration_ms + 'ms' : 'Pending'}</td></tr>
-      <tr><td>Remote addr</td><td>${r.remote_addr || 'N/A'}</td></tr>
-      <tr><td>TLS version</td><td>${r.tls_version || 'None'}</td></tr>
-      <tr><td>Tunnel ID</td><td>${r.tunnel_id || 'N/A'}</td></tr>
-    </table>`;
+    const table = element('table', 'headers');
+    appendHeaderRow(table, 'Captured at', r.captured_at || 'N/A');
+    appendHeaderRow(table, 'Duration', r.duration_ms != null ? r.duration_ms + 'ms' : 'Pending');
+    appendHeaderRow(table, 'Remote addr', r.remote_addr || 'N/A');
+    appendHeaderRow(table, 'TLS version', r.tls_version || 'None');
+    appendHeaderRow(table, 'Tunnel ID', r.tunnel_id || 'N/A');
+    return table;
   }
-  return '';
+  return document.createDocumentFragment();
+}
+
+function appendHeaderRow(table, key, value) {
+  const row = document.createElement('tr');
+  row.append(element('td', '', key), element('td', '', value));
+  table.append(row);
+}
+
+function decodeBody(body) {
+  try { return atob(body); } catch { return String(body); }
 }
 
 async function replay(id) {
   try {
-    const r = await fetch(API + '/api/requests/' + id + '/replay', { method: 'POST' });
+    const r = await mutate(API + '/api/requests/' + encodeURIComponent(id) + '/replay', { method: 'POST' });
     if (r.ok) { const d = await r.json(); setTimeout(loadRequests, 500); }
   } catch(e) { console.error('Replay failed', e); }
 }
 
 async function clearAll() {
-  await fetch(API + '/api/requests', { method: 'DELETE' });
+  await mutate(API + '/api/requests', { method: 'DELETE' });
   requests = []; selected = null; renderList();
-  document.getElementById('detailPane').innerHTML = '<div class="detail-empty">Select a request to inspect</div>';
+  document.getElementById('detailPane').replaceChildren(element('div', 'detail-empty', 'Select a request to inspect'));
 }
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
 document.getElementById('filter').addEventListener('input', renderList);
+document.getElementById('clearButton').addEventListener('click', clearAll);
 loadRequests();
 loadStatus();
 connectSSE();

@@ -280,11 +280,13 @@ async fn proxy_http_request(
 
     // Capture request metadata if inspection is enabled
     let capture_id = if inspect {
-        let req_headers: Vec<(String, String)> = parts
-            .headers
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.to_string(), vs.to_string())))
-            .collect();
+        let req_headers: Vec<(String, String)> = rgrok_proto::inspect::sanitize_headers(
+            &parts
+                .headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.to_string(), vs.to_string())))
+                .collect::<Vec<_>>(),
+        );
         let capture = rgrok_proto::inspect::CapturedRequest {
             id: uuid::Uuid::new_v4().to_string(),
             captured_at: chrono::Utc::now(),
@@ -401,15 +403,17 @@ async fn proxy_http_request(
     // Capture response metadata if inspection is enabled
     if let Some(cap_id) = capture_id {
         let duration_ms = start.elapsed().as_millis() as u64;
-        let resp_headers: Vec<(String, String)> = header_str
-            .lines()
-            .skip(1)
-            .take_while(|l| !l.is_empty())
-            .filter_map(|l| {
-                l.split_once(": ")
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect();
+        let resp_headers: Vec<(String, String)> = rgrok_proto::inspect::sanitize_headers(
+            &header_str
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .filter_map(|l| {
+                    l.split_once(": ")
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect::<Vec<_>>(),
+        );
 
         let body_truncated = body_data.len() > 1_048_576;
         let captured_body = if body_data.is_empty() {
@@ -436,7 +440,7 @@ async fn proxy_http_request(
                 if cap.id == cap_id {
                     cap.duration_ms = Some(duration_ms);
                     cap.resp_status = Some(status_code);
-                    cap.resp_headers = Some(resp_headers);
+                    cap.resp_headers = Some(rgrok_proto::inspect::sanitize_headers(&resp_headers));
                     cap.resp_body = captured_body;
                     cap.resp_body_truncated = body_truncated;
                     break;
