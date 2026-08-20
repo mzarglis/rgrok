@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
+use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{error, info, warn};
 
@@ -23,6 +25,8 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const MAX_CONNECT_ATTEMPTS: usize = 10;
 const STABLE_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONTROL_MESSAGE_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionFailureKind {
@@ -276,7 +280,7 @@ where
     };
 
     match result {
-        Ok(public_url) => Ok(Some((session, public_url))),
+        Ok(registration) => Ok(Some((session, registration))),
         Err(error) => {
             session.abort().await;
             Err(error)
@@ -309,11 +313,7 @@ async fn authenticate_and_register(
     let ctrl_stream = session.control.open_stream().await.map_err(|e| {
         SessionFailure::transient(anyhow::anyhow!("Failed to open control stream: {}", e))
     })?;
-    session.ctrl_stream = Some(ctrl_stream);
-    let ctrl_stream = session
-        .ctrl_stream
-        .as_mut()
-        .expect("control stream initialized");
+    let ctrl_stream = session.ctrl_stream.insert(ctrl_stream);
 
     write_msg_to_stream(
         ctrl_stream,
@@ -325,9 +325,17 @@ async fn authenticate_and_register(
     .await
     .map_err(|e| SessionFailure::transient(e.context("Failed to send authentication")))?;
 
-    let auth_response: ServerMsg = read_msg_from_stream(ctrl_stream).await.map_err(|e| {
-        SessionFailure::transient(e.context("Failed to read authentication response"))
-    })?;
+    let auth_response: ServerMsg =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg_from_stream(ctrl_stream))
+            .await
+            .map_err(|_| {
+                SessionFailure::transient(anyhow::anyhow!(
+                    "Timed out awaiting authentication response"
+                ))
+            })?
+            .map_err(|e| {
+                SessionFailure::transient(e.context("Failed to read authentication response"))
+            })?;
     let session_id = classify_auth_response(auth_response)?;
     info!(session_id = %session_id, "Authenticated");
 
@@ -346,10 +354,48 @@ async fn authenticate_and_register(
     .map_err(|e| SessionFailure::transient(e.context("Failed to register tunnel")))?;
 
     let registration_response: ServerMsg =
-        read_msg_from_stream(ctrl_stream).await.map_err(|e| {
-            SessionFailure::transient(e.context("Failed to read tunnel registration response"))
-        })?;
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg_from_stream(ctrl_stream))
+            .await
+            .map_err(|_| {
+                SessionFailure::transient(anyhow::anyhow!(
+                    "Timed out awaiting tunnel registration response"
+                ))
+            })?
+            .map_err(|e| {
+                SessionFailure::transient(e.context("Failed to read tunnel registration response"))
+            })?;
     classify_registration_response(registration_response)
+}
+
+async fn run_control_io(
+    ctrl_stream: yamux::Stream,
+    mut outbound_rx: mpsc::Receiver<ClientMsg>,
+    inbound_tx: mpsc::Sender<ServerMsg>,
+) -> anyhow::Result<()> {
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_CONTROL_MESSAGE_BYTES)
+        .new_codec();
+    let mut framed = tokio_util::codec::Framed::new(ctrl_stream.compat(), codec);
+
+    loop {
+        tokio::select! {
+            frame = framed.next() => {
+                let frame = frame
+                    .ok_or_else(|| anyhow::anyhow!("control stream closed"))??;
+                let message = rgrok_proto::decode_msg::<ServerMsg>(&frame)?;
+                if inbound_tx.send(message).await.is_err() {
+                    return Ok(());
+                }
+            }
+            message = outbound_rx.recv() => {
+                let Some(message) = message else {
+                    return Ok(());
+                };
+                let encoded = rgrok_proto::encode_msg(&message)?;
+                framed.send(encoded.into()).await?;
+            }
+        }
+    }
 }
 
 fn classify_auth_response(response: ServerMsg) -> Result<String, SessionFailure> {
@@ -406,7 +452,7 @@ async fn run_session<F>(
 where
     F: Future<Output = ()>,
 {
-    let (msg_tx, mut msg_rx) = mpsc::channel::<ClientMsg>(64);
+    let (msg_tx, msg_rx) = mpsc::channel::<ClientMsg>(64);
     let heartbeat_tx = msg_tx.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut seq = 0u64;
@@ -419,17 +465,20 @@ where
             }
         }
     });
+    let ctrl_stream = session
+        .ctrl_stream
+        .take()
+        .expect("established control stream");
+    let (server_msg_tx, mut server_msg_rx) = mpsc::channel::<ServerMsg>(64);
+    let mut control_handle = tokio::spawn(run_control_io(ctrl_stream, msg_rx, server_msg_tx));
+    let mut control_task_finished = false;
     let mut proxy_tasks = tokio::task::JoinSet::new();
     let exit = loop {
         tokio::select! {
             _ = shutdown.as_mut() => break SessionExit::Shutdown,
-            result = read_msg_from_stream::<ServerMsg>(session.ctrl_stream.as_mut().expect("established control stream")) => {
-                let msg = match result {
-                    Ok(m) => m,
-                    Err(e) => {
-                        info!(error = %e, "Control channel closed");
-                        break SessionExit::Disconnected;
-                    }
+            message = server_msg_rx.recv() => {
+                let Some(msg) = message else {
+                    break SessionExit::Disconnected;
                 };
 
                 match msg {
@@ -455,11 +504,14 @@ where
                     _ => {}
                 }
             }
-            Some(msg) = msg_rx.recv() => {
-                if let Err(e) = write_msg_to_stream(session.ctrl_stream.as_mut().expect("established control stream"), &msg).await {
-                    info!(error = %e, "Control channel write failed");
-                    break SessionExit::Disconnected;
+            result = &mut control_handle => {
+                control_task_finished = true;
+                match result {
+                    Ok(Ok(())) => info!("Control channel closed"),
+                    Ok(Err(error)) => info!(%error, "Control channel closed"),
+                    Err(error) => info!(%error, "Control channel task stopped"),
                 }
+                break SessionExit::Disconnected;
             }
             inbound = session.inbound_rx.recv() => {
                 match inbound {
@@ -488,6 +540,10 @@ where
     while proxy_tasks.join_next().await.is_some() {}
     heartbeat_handle.abort();
     let _ = heartbeat_handle.await;
+    if !control_task_finished {
+        control_handle.abort();
+        let _ = control_handle.await;
+    }
     session.abort().await;
     exit
 }

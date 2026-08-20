@@ -124,9 +124,10 @@ pub async fn provision_wildcard_cert(config: &Config) -> anyhow::Result<Arc<rust
             info!("ACME wildcard certificate provisioned successfully");
             Ok(tls_config)
         }
-        (Ok(_), Err(cleanup_error)) => Err(anyhow::anyhow!(
-            "ACME certificate provisioned, but TXT record cleanup failed: {cleanup_error}"
-        )),
+        (Ok(tls_config), Err(cleanup_error)) => {
+            warn!(%cleanup_error, "ACME certificate provisioned, but TXT record cleanup failed");
+            Ok(tls_config)
+        }
         (Err(primary_error), Ok(())) => Err(primary_error),
         (Err(primary_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
             "{primary_error}; additionally, TXT record cleanup failed: {cleanup_error}"

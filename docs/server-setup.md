@@ -224,8 +224,11 @@ docker build -t rgrok-server -f deploy/Dockerfile .
 # Prepare an operator-managed config (edit domain, TLS, and other settings).
 sudo cp config/server.example.toml /etc/rgrok/server.toml
 openssl rand -hex 32  # put this output in /etc/rgrok/server.toml as auth.secret
-# The image runs as its non-root rgrok user; the bind-mounted file must be readable.
-sudo chmod 644 /etc/rgrok/server.toml
+# The image pins its non-root rgrok user and group to UID/GID 10001.
+sudo chown root:10001 /etc/rgrok/server.toml
+sudo chmod 640 /etc/rgrok/server.toml
+sudo mkdir -p /var/lib/rgrok
+sudo chown 10001:10001 /var/lib/rgrok
 
 # Run (mount your config and cert storage)
 docker run -d \

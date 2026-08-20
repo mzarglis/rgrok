@@ -265,20 +265,28 @@ function appendHeaderRow(table, key, value) {
 }
 
 function decodeBody(body) {
-  try { return atob(body); } catch { return String(body); }
+  try {
+    const binary = atob(body);
+    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch { return String(body); }
 }
 
 async function replay(id) {
   try {
     const r = await mutate(API + '/api/requests/' + encodeURIComponent(id) + '/replay', { method: 'POST' });
-    if (r.ok) { const d = await r.json(); setTimeout(loadRequests, 500); }
-  } catch(e) { console.error('Replay failed', e); }
+    if (!r.ok) throw new Error((await r.text()) || 'Replay failed (' + r.status + ')');
+    setTimeout(loadRequests, 500);
+  } catch(e) { console.error('Replay failed', e); alert(e.message); }
 }
 
 async function clearAll() {
-  await mutate(API + '/api/requests', { method: 'DELETE' });
-  requests = []; selected = null; renderList();
-  document.getElementById('detailPane').replaceChildren(element('div', 'detail-empty', 'Select a request to inspect'));
+  try {
+    const response = await mutate(API + '/api/requests', { method: 'DELETE' });
+    if (!response.ok) throw new Error((await response.text()) || 'Failed to clear requests (' + response.status + ')');
+    requests = []; selected = null; renderList();
+    document.getElementById('detailPane').replaceChildren(element('div', 'detail-empty', 'Select a request to inspect'));
+  } catch(e) { console.error('Failed to clear requests', e); alert(e.message); }
 }
 
 document.getElementById('filter').addEventListener('input', renderList);

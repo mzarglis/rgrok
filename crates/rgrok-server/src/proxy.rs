@@ -10,6 +10,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info, warn};
@@ -20,6 +21,7 @@ use crate::auth;
 use crate::tunnel_manager::{ServerState, TunnelSession};
 
 const MAX_RESPONSE_HEADERS: usize = 65_536;
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 const READ_BUFFER_SIZE: usize = 8_192;
 const CLOSE_DELIMITED_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INSPECTION_BODY: usize = 1_048_576;
@@ -61,6 +63,19 @@ struct PreparedRequest {
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+    _body_guard: Option<BufferedRequestBody>,
+}
+
+struct BufferedRequestBody {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<crate::metrics::Metrics>,
+    bytes: i64,
+}
+
+impl Drop for BufferedRequestBody {
+    fn drop(&mut self) {
+        self.metrics.buffered_request_body_bytes.sub(self.bytes);
+    }
 }
 /// Serve the public HTTP proxy that routes requests to tunnels (port 80)
 /// All HTTP requests get a 301 redirect to HTTPS with HSTS.
@@ -254,6 +269,15 @@ async fn proxy_http_request(
     // Hyper has decoded the public framing. Bound collection before opening a
     // tunnel stream so a slow/oversized upload cannot occupy client capacity.
     let (parts, body) = req.into_parts();
+    let body_permit = match state.request_body_slots.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is shutting down",
+            ));
+        }
+    };
     let body_bytes = match collect_body_limited(body, max_request_body_bytes).await {
         Ok(body_bytes) => body_bytes,
         Err(BodyReadError::TooLarge) => {
@@ -269,11 +293,21 @@ async fn proxy_http_request(
             ));
         }
     };
+    let buffered_bytes = i64::try_from(body_bytes.len()).unwrap_or(i64::MAX);
+    state
+        .metrics
+        .buffered_request_body_bytes
+        .add(buffered_bytes);
     let request = PreparedRequest {
         method: parts.method,
         uri: parts.uri,
         headers: parts.headers,
         body: body_bytes,
+        _body_guard: Some(BufferedRequestBody {
+            _permit: body_permit,
+            metrics: state.metrics.clone(),
+            bytes: buffered_bytes,
+        }),
     };
 
     match proxy_request_to_tunnel(request, state, subdomain, tunnel, None).await {
@@ -340,6 +374,7 @@ pub(crate) async fn replay_http_request(
         uri,
         headers,
         body,
+        _body_guard: None,
     };
 
     proxy_request_to_tunnel(
@@ -380,6 +415,7 @@ async fn proxy_request_to_tunnel(
     tunnel: Arc<TunnelSession>,
     capture_id: Option<String>,
 ) -> Result<Response<Full<Bytes>>, StatusCode> {
+    let is_replay = capture_id.is_some();
     let mut proxy_stream = request_proxy_stream(&tunnel)
         .await
         .ok_or(StatusCode::GATEWAY_TIMEOUT)?;
@@ -405,7 +441,6 @@ async fn proxy_request_to_tunnel(
         ))
     };
     let capture_id = if inspect {
-        let is_replay = capture_id.is_some();
         let id = capture_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         state
             .store_capture(
@@ -446,11 +481,12 @@ async fn proxy_request_to_tunnel(
     // hop-by-hop fields and replace any incoming Transfer-Encoding/Content-Length with the
     // decoded body length. Connection tokens name additional hop-by-hop headers and are removed
     // as well (RFC 9110 section 7.6.1).
-    let raw_request = serialize_http_request(
-        &request,
-        request.body.len(),
-        tunnel.options.host_header.as_deref(),
-    );
+    let host_header = tunnel
+        .options
+        .host_header
+        .as_deref()
+        .or_else(|| is_replay.then_some(tunnel.subdomain.as_str()));
+    let raw_request = serialize_http_request(&request, request.body.len(), host_header);
 
     // Write headers into the proxy stream
     if proxy_stream
@@ -475,12 +511,12 @@ async fn proxy_request_to_tunnel(
     .await
     {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
+            warn!(%error, "Failed to parse response from tunnel");
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
     let status_code = parsed_response.status_code;
-    let header_str = parsed_response.header_text;
     let body_data = parsed_response.body;
     let response_headers = parsed_response.headers;
     let response_no_body = response_has_no_body(&request.method, status_code);
@@ -520,17 +556,7 @@ async fn proxy_request_to_tunnel(
     // Capture response metadata if inspection is enabled
     if let Some(cap_id) = capture_id {
         let duration_ms = start.elapsed().as_millis() as u64;
-        let resp_headers: Vec<(String, String)> = rgrok_proto::inspect::sanitize_headers(
-            &header_str
-                .lines()
-                .skip(1)
-                .take_while(|l| !l.is_empty())
-                .filter_map(|l| {
-                    l.split_once(": ")
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                })
-                .collect::<Vec<_>>(),
-        );
+        let resp_headers = rgrok_proto::inspect::sanitize_headers(&response_headers);
 
         let body_truncated = body_data.len() > MAX_INSPECTION_BODY;
         let captured_body = if body_data.is_empty() {
@@ -555,7 +581,7 @@ async fn proxy_request_to_tunnel(
                 if cap.id == cap_id {
                     cap.duration_ms = Some(duration_ms);
                     cap.resp_status = Some(status_code);
-                    cap.resp_headers = Some(rgrok_proto::inspect::sanitize_headers(&resp_headers));
+                    cap.resp_headers = Some(resp_headers);
                     cap.resp_body = captured_body;
                     cap.resp_body_truncated = body_truncated;
                     break;
@@ -590,7 +616,6 @@ async fn proxy_request_to_tunnel(
 struct ParsedHttpResponse {
     status_code: u16,
     headers: Vec<(String, String)>,
-    header_text: String,
     body: Vec<u8>,
 }
 
@@ -608,7 +633,8 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buffered = Vec::with_capacity(READ_BUFFER_SIZE);
-    let (status_code, headers, header_text) = loop {
+    let mut informational_responses = 0;
+    let (status_code, headers) = loop {
         let header_end = read_header_section(stream, &mut buffered).await?;
         let header_bytes = buffered[..header_end].to_vec();
         let header_text = std::str::from_utf8(&header_bytes)?.to_string();
@@ -619,16 +645,19 @@ where
         // Keep parsing until the final response, while 101 Switching Protocols is terminal for
         // HTTP/1.1 framing and is treated as a no-body response below.
         if (100..200).contains(&status_code) && status_code != 101 {
+            informational_responses += 1;
+            if informational_responses > MAX_INFORMATIONAL_RESPONSES {
+                anyhow::bail!("too many informational responses");
+            }
             continue;
         }
-        break (status_code, headers, header_text);
+        break (status_code, headers);
     };
 
     if response_has_no_body(request_method, status_code) {
         return Ok(ParsedHttpResponse {
             status_code,
             headers,
-            header_text,
             body: Vec::new(),
         });
     }
@@ -657,7 +686,6 @@ where
     Ok(ParsedHttpResponse {
         status_code,
         headers,
-        header_text,
         body,
     })
 }
@@ -1250,6 +1278,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn excessive_informational_responses_are_rejected() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        let response = "HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_INFORMATIONAL_RESPONSES + 1);
+        peer.write_all(response.as_bytes()).await.unwrap();
+
+        let error = read_http_response(&mut stream, &Method::POST, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many informational"));
+    }
+
+    #[tokio::test]
+    async fn close_delimited_response_reads_until_eof() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+            .await
+            .unwrap();
+        drop(peer);
+
+        let response = read_http_response(&mut stream, &Method::GET, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_lengths_are_rejected() {
+        let (mut stream, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ntest")
+            .await
+            .unwrap();
+
+        assert!(read_http_response(&mut stream, &Method::GET, usize::MAX)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn head_and_no_content_responses_have_no_body() {
         let (mut stream, mut peer) = tokio::io::duplex(4096);
         peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
@@ -1301,6 +1367,7 @@ mod tests {
             uri: parts.uri,
             headers: parts.headers,
             body: Bytes::new(),
+            _body_guard: None,
         };
 
         let serialized = serialize_http_request(&request, 11, None);

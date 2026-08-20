@@ -10,7 +10,8 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --create-home --shell /usr/sbin/nologin rgrok \
+RUN groupadd --system --gid 10001 rgrok \
+    && useradd --system --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin rgrok \
     && mkdir -p /etc/rgrok /var/lib/rgrok/certs \
     && chown -R rgrok:rgrok /var/lib/rgrok
 

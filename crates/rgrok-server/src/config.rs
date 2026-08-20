@@ -139,12 +139,10 @@ fn default_buffer_size() -> usize {
 }
 
 pub(crate) fn is_loopback_bind(bind: &str) -> bool {
-    let bind = bind.trim().trim_start_matches('[').trim_end_matches(']');
-    bind.eq_ignore_ascii_case("localhost")
-        || bind
-            .parse::<std::net::IpAddr>()
-            .map(|addr| addr.is_loopback())
-            .unwrap_or(false)
+    let bind = bind.trim();
+    bind.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+        || rgrok_proto::inspect::is_loopback_authority(bind)
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -200,19 +198,23 @@ impl Config {
         if self.server.max_response_body_bytes == 0 {
             anyhow::bail!("server.max_response_body_bytes must be greater than zero");
         }
-        if self.inspect.ui_port != 0
-            && !is_loopback_bind(&self.inspect.ui_bind)
-            && self
+        if self.inspect.ui_port != 0 && !is_loopback_bind(&self.inspect.ui_bind) {
+            let token = self
                 .inspect
                 .ui_auth_token
                 .as_deref()
                 .map(str::trim)
                 .filter(|token| !token.is_empty())
-                .is_none()
-        {
-            anyhow::bail!(
-                "inspect.ui_auth_token must be configured when inspect.ui_bind is non-loopback"
-            );
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                    "inspect.ui_auth_token must be configured when inspect.ui_bind is non-loopback"
+                )
+                })?;
+            if is_placeholder_secret(token) {
+                anyhow::bail!(
+                    "inspect.ui_auth_token must not be a placeholder when inspect.ui_bind is non-loopback"
+                );
+            }
         }
         Ok(())
     }
@@ -227,13 +229,14 @@ fn is_placeholder_secret(secret: &str) -> bool {
         "changeme",
         "change_me",
         "change-me",
+        "change-this-to",
         "generate_with",
         "replace_with",
         "your-secret",
         "your_secret",
         "<your",
         "placeholder",
-        "example",
+        "example.com",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
@@ -393,6 +396,7 @@ secret = "CHANGEME_generate_with_openssl_rand_hex_32"
             "CHANGEME_replace_with_a_secret_generated_for_this_host"
         ));
         assert!(!is_placeholder_secret("7d2c6b9e4f1a8c0e3b5d9f2a6c8e1b4d"));
+        assert!(!is_placeholder_secret("a-legitimate-example-passphrase"));
     }
 
     #[test]
@@ -502,6 +506,17 @@ secret = "abcdefghijklmnopqrstuvwxyz123456"
 
         config.inspect.ui_auth_token = Some("ui-secret".to_string());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn non_loopback_inspection_rejects_placeholder_authentication() {
+        let mut config: Config = toml::from_str(valid_toml()).unwrap();
+        config.inspect.ui_port = 4040;
+        config.inspect.ui_bind = "0.0.0.0".to_string();
+        config.inspect.ui_auth_token = Some("change-this-to-a-long-random-value".to_string());
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("must not be a placeholder"));
     }
 
     #[test]

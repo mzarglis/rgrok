@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
@@ -115,7 +116,7 @@ where
     let ws_compat = WsCompat::new(ws);
     let mux = yamux::Connection::new(ws_compat, yamux_config(), yamux::Mode::Server);
 
-    let (_mux_control, mut inbound_rx, driver_handle) = spawn_yamux_driver(mux);
+    let (_mux_control, mut inbound_rx, mut driver_handle) = spawn_yamux_driver(mux);
 
     // Accept stream 0 = control channel (with timeout)
     let mut ctrl_stream =
@@ -160,6 +161,8 @@ where
                 },
             )
             .await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+            abort_driver_after_flush(&mut driver_handle).await;
             return;
         }
     };
@@ -176,6 +179,8 @@ where
             },
         )
         .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
         return;
     }
 
@@ -195,6 +200,8 @@ where
             },
         )
         .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
         return;
     }
 
@@ -210,6 +217,8 @@ where
                 },
             )
             .await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+            abort_driver_after_flush(&mut driver_handle).await;
             return;
         }
     };
@@ -224,6 +233,8 @@ where
             },
         )
         .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), ctrl_stream.close()).await;
+        abort_driver_after_flush(&mut driver_handle).await;
         return;
     }
 
@@ -341,6 +352,15 @@ where
     }
     accept_handle.abort();
     driver_handle.abort();
+}
+
+async fn abort_driver_after_flush(driver_handle: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_millis(100), &mut *driver_handle)
+        .await
+        .is_err()
+    {
+        driver_handle.abort();
+    }
 }
 
 /// Handle a proxy data stream: read its correlation ID and resolve only the

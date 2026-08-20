@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use rgrok_proto::inspect::{CapturedRequest, InspectEvent};
@@ -52,6 +52,8 @@ pub struct ServerState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Bounded bcrypt verifier shared by public HTTP handlers.
     pub basic_auth_verifier: BasicAuthVerifier,
+    /// Limits how many public request bodies can be buffered concurrently.
+    pub request_body_slots: Arc<Semaphore>,
     /// Hot-reloadable TLS config (watched by proxy listeners)
     pub tls_config: tokio::sync::watch::Sender<Option<Arc<rustls::ServerConfig>>>,
     #[allow(dead_code)]
@@ -86,6 +88,7 @@ impl ServerState {
             revocation_epoch,
             metrics: Arc::new(crate::metrics::Metrics::new()),
             basic_auth_verifier: BasicAuthVerifier::default(),
+            request_body_slots: Arc::new(Semaphore::new(4)),
             tls_config: tls_tx,
             tls_config_rx: tls_rx,
             cleanup_notify: Arc::new(tokio::sync::Notify::new()),
@@ -397,6 +400,7 @@ impl ServerState {
         if listener_stopped {
             self.release_tcp_port_reservation(port, &removed.id);
         } else {
+            self.metrics.tcp_reservations_retained.inc();
             tracing::warn!(
                 port,
                 "TCP listener did not stop; retaining port reservation"
@@ -533,6 +537,12 @@ impl ConnectionStreamState {
     }
 }
 
+impl Default for ConnectionStreamState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Represents an active tunnel session from a connected client.
 pub struct TunnelSession {
     pub id: String,
@@ -631,25 +641,7 @@ mod tests {
     }
 
     fn make_tunnel_session(subdomain: &str) -> Arc<TunnelSession> {
-        let (tx, _rx) = mpsc::channel(1);
-        Arc::new(TunnelSession {
-            id: "test-id".to_string(),
-            tunnel_type: TunnelType::Http,
-            subdomain: subdomain.to_string(),
-            basic_auth_username: None,
-            basic_auth_hash: None,
-            options: TunnelOptions::default(),
-            created_at: Instant::now(),
-            last_activity: StdMutex::new(Instant::now()),
-            active_streams: AtomicUsize::new(0),
-            dns_record_id: None,
-            idle_cancel: CancellationToken::new(),
-            control_tx: tx,
-            stream_state: Arc::new(ConnectionStreamState::new()),
-            cancel: CancellationToken::new(),
-            listener_stopped: Mutex::new(None),
-            cached_auth_fingerprint: Mutex::new(None),
-        })
+        make_test_session(subdomain, "test-id")
     }
 
     #[tokio::test]

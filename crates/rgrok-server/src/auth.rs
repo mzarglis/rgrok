@@ -2,14 +2,22 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Maximum number of bcrypt verifications that may run concurrently.
+/// Default number of bcrypt verifications that may run concurrently.
 ///
 /// bcrypt is deliberately CPU-intensive.  Keeping this limit separate from
 /// Tokio's blocking-pool limit prevents an invalid-credential flood from
 /// filling that pool with work that cannot make progress concurrently anyway.
-pub const BASIC_AUTH_MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+const BASIC_AUTH_PERMIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn default_basic_auth_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
 
 /// Runs password verification on Tokio's blocking pool with bounded
 /// concurrency.
@@ -20,7 +28,7 @@ pub struct BasicAuthVerifier {
 
 impl Default for BasicAuthVerifier {
     fn default() -> Self {
-        Self::new(BASIC_AUTH_MAX_CONCURRENT_VERIFICATIONS)
+        Self::new(default_basic_auth_concurrency())
     }
 }
 
@@ -32,7 +40,13 @@ impl BasicAuthVerifier {
     }
 
     async fn acquire_permit(&self) -> Option<OwnedSemaphorePermit> {
-        self.permits.clone().acquire_owned().await.ok()
+        tokio::time::timeout(
+            BASIC_AUTH_PERMIT_TIMEOUT,
+            self.permits.clone().acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     /// Verify a Basic authorization header without retaining its decoded
@@ -255,7 +269,7 @@ mod tests {
         first_started_rx.await.unwrap();
         assert_eq!(verifier.available_permits(), 0);
 
-        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
         let second_verifier = verifier.clone();
         let second = tokio::spawn(async move {
             second_verifier
@@ -269,6 +283,10 @@ mod tests {
         // The second operation cannot start until the first operation drops
         // its permit, and therefore remains pending while the first is held.
         assert_eq!(verifier.available_permits(), 0);
+        assert!(matches!(
+            second_started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         release_first_tx.send(()).unwrap();
         assert_eq!(first.await.unwrap(), Some(1));
         second_started_rx.await.unwrap();

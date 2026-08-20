@@ -52,9 +52,10 @@ base64         = "0.22"
 crossterm      = "0.29"
 pin-project-lite = "0.2"
 tokio-stream     = { version = "0.1", features = ["sync"] }
-tokio-util       = { version = "0.7", features = ["compat"] }
+tokio-util       = { version = "0.7", features = ["compat", "codec"] }
 prometheus       = "0.14"
 x509-parser      = "0.16"
+subtle           = "2"
 
 [profile.release]
 strip = true

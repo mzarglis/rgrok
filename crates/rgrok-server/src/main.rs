@@ -12,6 +12,7 @@ mod web_ui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio_rustls::TlsAcceptor;
 use tracing::info;
@@ -80,13 +81,13 @@ async fn main() -> anyhow::Result<()> {
     // Select the certificate source before loading it. In particular, a
     // Cloudflare-enabled first run must provision ACME instead of silently
     // falling back to a self-signed development certificate.
-    let tls_source = tls::select_tls_source(&config)?;
+    let tls_source = tls::select_tls_source(&config).context("failed to select TLS source")?;
     let tls_config = match tls_source {
         tls::TlsSource::AcmeProvision => {
             info!("No existing TLS certs, attempting Cloudflare ACME provisioning");
             tls::provision_wildcard_cert(&config).await?
         }
-        _ => tls::load_tls_config(&config)?,
+        _ => tls::load_tls_config(&config).context("failed to load TLS configuration")?,
     };
     let tls_acceptor = TlsAcceptor::from(tls_config.clone());
     let control_tls_enabled = !matches!(tls_source, tls::TlsSource::SelfSigned);
@@ -359,7 +360,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -384,7 +385,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: "rgrok_tok_bogus".to_string(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -419,7 +420,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -469,7 +470,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token,
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -515,7 +516,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -570,7 +571,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -605,7 +606,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -669,7 +670,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -776,7 +777,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -873,7 +874,8 @@ mod tests {
         assert!(request_text.starts_with("POST /echo?from=replay HTTP/1.1\r\n"));
         assert!(request_text_lower.contains("content-type: text/plain\r\n"));
         assert!(request_text_lower.contains("content-length: 12\r\n"));
-        assert!(!request_text_lower.contains("host:"));
+        assert!(request_text_lower.contains("host: replay\r\n"));
+        assert!(!request_text_lower.contains("host: replay.example.com\r\n"));
         assert!(!request_text_lower.contains("authorization:"));
         assert!(!request_text_lower.contains("cookie:"));
         assert!(!request_text_lower.contains("connection:"));
@@ -934,7 +936,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token: test_token(),
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await
@@ -1013,7 +1015,7 @@ mod tests {
                     &mut ctrl,
                     &ClientMsg::Auth {
                         token: test_token(),
-                        version: "0.1.0".to_string(),
+                        version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
                     },
                 )
                 .await
@@ -1107,7 +1109,7 @@ mod tests {
             &mut ctrl,
             &ClientMsg::Auth {
                 token,
-                version: "0.1.0".to_string(),
+                version: rgrok_proto::CONTROL_PROTOCOL_VERSION.to_string(),
             },
         )
         .await

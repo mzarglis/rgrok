@@ -39,6 +39,7 @@ pub fn capture_request_from_bytes(
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4);
 
+    let body_length = header_end.map_or(0, |pos| data.len().saturating_sub(pos));
     let body = header_end.and_then(|pos| {
         if pos < data.len() {
             let body_bytes = &data[pos..];
@@ -58,7 +59,7 @@ pub fn capture_request_from_bytes(
         req_url: url,
         req_headers: rgrok_proto::inspect::sanitize_headers(&headers),
         req_body: body,
-        req_body_truncated: false,
+        req_body_truncated: body_length > MAX_BODY_CAPTURE,
         resp_status: None,
         resp_headers: None,
         resp_body: None,
@@ -96,4 +97,19 @@ pub fn parse_response_headers(data: &[u8]) -> Vec<(String, String)> {
     }
 
     rgrok_proto::inspect::sanitize_headers(&headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_marks_truncated_request_bodies() {
+        let mut request = b"POST / HTTP/1.1\r\nHost: example\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'x', MAX_BODY_CAPTURE + 1));
+
+        let capture = capture_request_from_bytes(&request, "tunnel", "127.0.0.1").unwrap();
+        assert!(capture.req_body_truncated);
+        assert_eq!(capture.req_body.unwrap().len(), MAX_BODY_CAPTURE);
+    }
 }

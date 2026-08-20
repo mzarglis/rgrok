@@ -10,6 +10,8 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::stream::Stream;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
@@ -142,11 +144,17 @@ async fn inspect_security(request: Request, next: Next, security: Arc<UiSecurity
 fn authorized_header(value: &str, token: &str) -> bool {
     value
         .strip_prefix("Bearer ")
-        .map(|candidate| candidate == token)
+        .map(|candidate| tokens_equal(candidate, token))
         .unwrap_or(false)
         || auth::parse_basic_auth_header(value)
-            .map(|(user, password)| user == "rgrok" && password == token)
+            .map(|(user, password)| user == "rgrok" && tokens_equal(&password, token))
             .unwrap_or(false)
+}
+
+fn tokens_equal(candidate: &str, expected: &str) -> bool {
+    let candidate = Sha256::digest(candidate.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    bool::from(candidate.ct_eq(&expected))
 }
 
 fn unauthorized_response() -> Response {

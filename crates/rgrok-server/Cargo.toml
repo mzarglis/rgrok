@@ -55,3 +55,4 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 prometheus = { workspace = true }
 x509-parser = { workspace = true }
+subtle = { workspace = true }

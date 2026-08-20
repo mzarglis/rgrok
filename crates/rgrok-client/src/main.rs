@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = ClientConfig::load(&cli.config)?;
 
     // Apply server override from CLI
+    validate_transport_overrides(cli.server.as_deref(), cli.insecure)?;
     if let Some(server) = &cli.server {
         apply_server_override(&mut config, server)?;
     }
@@ -95,6 +96,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_transport_overrides(server: Option<&str>, insecure: bool) -> anyhow::Result<()> {
+    if insecure
+        && server.is_some_and(|server| {
+            server
+                .split_once("://")
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("wss"))
+        })
+    {
+        anyhow::bail!("--insecure conflicts with an explicit wss:// --server address");
+    }
     Ok(())
 }
 
@@ -178,13 +192,17 @@ fn parse_server_port(port: &str, server: &str) -> anyhow::Result<u16> {
     if port.is_empty() {
         anyhow::bail!("Invalid server address '{}': port is empty", server);
     }
-    port.parse::<u16>().map_err(|_| {
+    let port = port.parse::<u16>().map_err(|_| {
         anyhow::anyhow!(
             "Invalid server port '{}' in '{}': expected 1-65535",
             port,
             server
         )
-    })
+    })?;
+    if port == 0 {
+        anyhow::bail!("Invalid server port '0' in '{}': expected 1-65535", server);
+    }
+    Ok(port)
 }
 
 fn init_tracing(config: &ClientConfig) {
@@ -244,5 +262,42 @@ mod tests {
             .expect_err("https is not a control WebSocket scheme");
 
         assert!(error.to_string().contains("use ws:// or wss://"));
+    }
+
+    #[test]
+    fn server_override_rejects_malformed_authorities() {
+        for server in [
+            "relay.example.com/path",
+            "relay.example.com?query",
+            "relay.example.com#fragment",
+            "2001:db8::1",
+            "[::1",
+            ":7835",
+            "relay.example.com:",
+        ] {
+            let mut config = ClientConfig::default();
+            assert!(
+                apply_server_override(&mut config, server).is_err(),
+                "expected {server:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn server_override_rejects_zero_port() {
+        let mut config = ClientConfig::default();
+        let error = apply_server_override(&mut config, "relay.example.com:0").unwrap_err();
+        assert!(error.to_string().contains("expected 1-65535"));
+    }
+
+    #[test]
+    fn explicit_secure_server_conflicts_with_insecure_flag() {
+        let error = validate_transport_overrides(Some("wss://relay.example.com"), true)
+            .expect_err("explicit secure transport must not be downgraded");
+        assert!(error.to_string().contains("conflicts"));
+
+        validate_transport_overrides(Some("ws://127.0.0.1"), true).unwrap();
+        validate_transport_overrides(Some("relay.example.com"), true).unwrap();
+        validate_transport_overrides(Some("wss://relay.example.com"), false).unwrap();
     }
 }

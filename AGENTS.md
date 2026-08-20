@@ -76,7 +76,7 @@ TCP ports are pinned after their first assignment so reconnects keep the same pu
 
 ## Workspace Structure
 
-```
+```text
 crates/
   rgrok-proto/    # Shared protocol: messages, framing, transport (no I/O)
   rgrok-server/   # VPS daemon — TLS termination, tunnel manager, HTTP proxy
@@ -172,7 +172,7 @@ All commits to `main` go through pull requests (branch protection enforced). PRs
 
 PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
+```text
 <type>[optional scope][!]: <description>
 ```
 
